@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -100,6 +102,7 @@ FORBIDDEN_ATTRIBUTES = {
 
 MAX_EXPRESSION_LENGTH = 1000
 MAX_REGEX_PATTERN_LENGTH = 200
+GREL_TRANSFORM_TIMEOUT_SECONDS = float(os.getenv("GREL_TRANSFORM_TIMEOUT_SECONDS", "30.0"))
 
 
 def _validate_regex_safety(pattern: str) -> None:
@@ -110,9 +113,12 @@ def _validate_regex_safety(pattern: str) -> None:
         raise GRELSecurityError(
             f"Regex pattern exceeds maximum allowed length of {MAX_REGEX_PATTERN_LENGTH} characters."
         )
-    # Detect dangerous nested quantifiers causing catastrophic backtracking, e.g. (a+)+ or (.*a)+
-    if re.search(r"(\([^\)]*[\+\*]\)[\+\*])", pattern):
+    # Detect dangerous nested quantifiers causing catastrophic backtracking, e.g. (a+)+, (.*a)+, (a+){2,}
+    if re.search(r"(\([^\)]*[\+\*\{][^\)]*\)[\+\*\{])", pattern):
         raise GRELSecurityError("Dangerous nested quantifier detected in regex (potential ReDoS risk).")
+    # Detect ambiguous alternation with repetition, e.g. (a|a)+
+    if re.search(r"\(([^|)]+)\|(\1)\)[\+\*]", pattern):
+        raise GRELSecurityError("Ambiguous overlapping alternation detected in regex (potential ReDoS risk).")
     try:
         re.compile(pattern)
     except re.error as e:
@@ -679,9 +685,12 @@ def preview_grel(
 ) -> Dict[str, Any]:
     """
     Evaluate GREL expression on a sample of rows and return before/after preview.
+    Enforces maximum sample row boundary of 100 rows.
     """
     if column not in df.columns:
         raise ValueError(f"Column '{column}' does not exist in dataset.")
+
+    sample_limit = min(max(1, int(sample_limit)), 100)
 
     try:
         compiled = CompiledGRELExpression(expression)
@@ -736,19 +745,29 @@ def execute_grel_transform(
     column: str,
     expression: str,
     on_error: str = "keep",
+    timeout_seconds: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Apply GREL expression to an entire DataFrame column and return modified copy.
-    on_error options: 'keep' (retain original), 'set_null', 'set_empty'
+    on_error options: 'keep' (retain original), 'set_null', 'set_empty'.
+    Enforces timeout protection against runaway transformations.
     """
     if column not in df.columns:
         raise ValueError(f"Column '{column}' does not exist.")
+
+    timeout = timeout_seconds if timeout_seconds is not None else GREL_TRANSFORM_TIMEOUT_SECONDS
+    start_time = time.time()
 
     compiled = CompiledGRELExpression(expression)
     res_df = df.copy()
 
     transformed_vals = []
     for idx, (_, row) in enumerate(df.iterrows()):
+        if idx % 1000 == 0 and (time.time() - start_time) > timeout:
+            raise GRELExecutionError(
+                f"GREL transformation exceeded maximum execution timeout of {timeout}s after processing {idx:,} rows."
+            )
+
         val = row[column]
         try:
             new_val = compiled.evaluate(val, row=row.to_dict(), index=idx)

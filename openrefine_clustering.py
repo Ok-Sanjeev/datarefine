@@ -18,7 +18,9 @@ Implements core key-collision and edit-distance clustering algorithms:
 
 from __future__ import annotations
 
+import os
 import re
+import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -489,9 +491,35 @@ def cluster_by_key_collision(
 
 
 # Limits for distance-based clustering scalability and resource protection
-MAX_UNIQUE_VALUES_DISTANCE = 3000
-MAX_STRING_LENGTH_DISTANCE = 150
-MAX_PAIRWISE_COMPARISONS = 250_000
+MAX_UNIQUE_VALUES_DISTANCE = int(os.getenv("MAX_CLUSTERING_UNIQUE_VALUES", "3000"))
+MAX_STRING_LENGTH_DISTANCE = int(os.getenv("MAX_CLUSTERING_STRING_LENGTH", "150"))
+MAX_PAIRWISE_COMPARISONS = int(os.getenv("MAX_CLUSTERING_PAIRWISE_COMPARISONS", "250000"))
+CLUSTERING_TIMEOUT_SECONDS = float(os.getenv("CLUSTERING_TIMEOUT_SECONDS", "15.0"))
+
+
+class ClusterList(list):
+    """
+    Subclass of list returned by detect_clusters to preserve exact list behavior
+    while providing metadata on truncation, warnings, evaluated counts, and execution metrics.
+    """
+
+    def __init__(
+        self,
+        iterable=None,
+        total_unique: int = 0,
+        evaluated_unique: int = 0,
+        truncated: bool = False,
+        warning: Optional[str] = None,
+        timeout: bool = False,
+        elapsed_seconds: float = 0.0,
+    ):
+        super().__init__(iterable or [])
+        self.total_unique = total_unique
+        self.evaluated_unique = evaluated_unique
+        self.truncated = truncated
+        self.warning = warning
+        self.timeout = timeout
+        self.elapsed_seconds = elapsed_seconds
 
 
 def cluster_by_distance(
@@ -500,31 +528,27 @@ def cluster_by_distance(
     min_similarity: float = 0.80,
     use_damerau: bool = False,
     method_name: str = "levenshtein",
-) -> List[ClusterResult]:
+    timeout_seconds: Optional[float] = None,
+) -> Tuple[List[ClusterResult], Dict[str, Any]]:
     """
     Cluster unique values using complete-linkage distance clustering with length pruning.
-
-    Clustering Semantics:
-    - Seed Selection: The most frequent unassigned value acts as the cluster seed / medoid.
-    - Complete-Linkage Guarantee: To prevent transitive chaining/drift (e.g. 'cat' -> 'bat'
-      -> 'bad' -> 'bed'), every member added to a cluster must satisfy the distance and similarity
-      thresholds against the seed and all already-admitted cluster members.
-    - Scalability Controls:
-      - Limits unique values evaluated to top MAX_UNIQUE_VALUES_DISTANCE.
-      - Skips strings exceeding MAX_STRING_LENGTH_DISTANCE characters.
-      - Enforces length-difference pruning (|len(a) - len(b)| <= max_distance).
-      - Caps total pairwise distance calculations at MAX_PAIRWISE_COMPARISONS.
+    Returns (clusters, metadata).
     """
+    timeout = timeout_seconds if timeout_seconds is not None else CLUSTERING_TIMEOUT_SECONDS
+    start_time = time.time()
+    timed_out = False
+
     dist_func = damerau_levenshtein_distance if use_damerau else levenshtein_distance
     val_items = [
         (str(val), count) for val, count in value_counts.items()
         if str(val).strip() and len(str(val)) <= MAX_STRING_LENGTH_DISTANCE
     ]
     if len(val_items) <= 1:
-        return []
+        return [], {"evaluated_unique": len(val_items), "timed_out": False, "evaluations": 0}
 
     # Sort by frequency descending and cap at max unique values
     val_items.sort(key=lambda x: -x[1])
+    total_eligible = len(val_items)
     val_items = val_items[:MAX_UNIQUE_VALUES_DISTANCE]
     n = len(val_items)
 
@@ -534,6 +558,10 @@ def cluster_by_distance(
     evaluations_count = 0
 
     for i in range(n):
+        if time.time() - start_time > timeout:
+            timed_out = True
+            break
+
         val_i, count_i = val_items[i]
         if val_i in assigned:
             continue
@@ -544,6 +572,9 @@ def cluster_by_distance(
 
         for j in range(i + 1, n):
             if evaluations_count >= MAX_PAIRWISE_COMPARISONS:
+                break
+            if time.time() - start_time > timeout:
+                timed_out = True
                 break
 
             val_j, count_j = val_items[j]
@@ -606,7 +637,15 @@ def cluster_by_distance(
             )
             idx += 1
 
-    return sorted(clusters, key=lambda c: (-c.total_rows, -len(c.members)))
+    sorted_clusters = sorted(clusters, key=lambda c: (-c.total_rows, -len(c.members)))
+    meta = {
+        "evaluated_unique": n,
+        "total_eligible": total_eligible,
+        "timed_out": timed_out,
+        "evaluations": evaluations_count,
+        "elapsed_seconds": round(time.time() - start_time, 3),
+    }
+    return sorted_clusters, meta
 
 
 # =====================================================================
@@ -646,6 +685,13 @@ def detect_clusters(
 
     method = method.lower().strip()
 
+    total_unique = len(value_counts)
+    evaluated_unique = total_unique
+    truncated = False
+    warning = None
+    timed_out = False
+    elapsed_sec = 0.0
+
     if method == "fingerprint":
         results = cluster_by_key_collision(value_counts, fingerprint, "fingerprint")
     elif method in ("ngram_fingerprint", "ngram"):
@@ -659,27 +705,43 @@ def detect_clusters(
         results = cluster_by_key_collision(value_counts, soundex, "soundex")
     elif method == "metaphone":
         results = cluster_by_key_collision(value_counts, metaphone, "metaphone")
-    elif method == "levenshtein":
+    elif method in ("levenshtein", "damerau_levenshtein", "damerau"):
         max_dist = int(params.get("max_distance", 1))
         min_sim = float(params.get("min_similarity", 0.80))
-        results = cluster_by_distance(
+        use_damerau = method in ("damerau_levenshtein", "damerau")
+        method_label = "damerau_levenshtein" if use_damerau else "levenshtein"
+        results, meta = cluster_by_distance(
             value_counts,
             max_distance=max_dist,
             min_similarity=min_sim,
-            use_damerau=False,
-            method_name="levenshtein",
+            use_damerau=use_damerau,
+            method_name=method_label,
+            timeout_seconds=float(params.get("timeout_seconds", CLUSTERING_TIMEOUT_SECONDS)),
         )
-    elif method in ("damerau_levenshtein", "damerau"):
-        max_dist = int(params.get("max_distance", 1))
-        min_sim = float(params.get("min_similarity", 0.80))
-        results = cluster_by_distance(
-            value_counts,
-            max_distance=max_dist,
-            min_similarity=min_sim,
-            use_damerau=True,
-            method_name="damerau_levenshtein",
-        )
+        evaluated_unique = meta.get("evaluated_unique", total_unique)
+        timed_out = meta.get("timed_out", False)
+        elapsed_sec = meta.get("elapsed_seconds", 0.0)
+
+        if meta.get("total_eligible", total_unique) > MAX_UNIQUE_VALUES_DISTANCE:
+            truncated = True
+            warning = (
+                f"Column contains {meta.get('total_eligible', total_unique):,} unique values; "
+                f"clustering was capped to the top {MAX_UNIQUE_VALUES_DISTANCE:,} most frequent values for performance."
+            )
+        if timed_out:
+            truncated = True
+            timeout_msg = f"Clustering reached execution timeout of {CLUSTERING_TIMEOUT_SECONDS}s; partial results returned."
+            warning = f"{warning} {timeout_msg}" if warning else timeout_msg
     else:
         raise ValueError(f"Unknown clustering method '{method}'. Supported: {list(SUPPORTED_CLUSTERING_METHODS.keys())}")
 
-    return [c.to_dict() for c in results]
+    serialized = [c.to_dict() for c in results]
+    return ClusterList(
+        serialized,
+        total_unique=total_unique,
+        evaluated_unique=evaluated_unique,
+        truncated=truncated,
+        warning=warning,
+        timeout=timed_out,
+        elapsed_seconds=elapsed_sec,
+    )

@@ -8,6 +8,13 @@ import pandas as pd
 
 FILE_PATH = "data/Messy_Employee_dataset.csv"
 
+# Configurable resource limits for large CSV ingestion and profiling
+MAX_UPLOAD_SIZE_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(100 * 1024 * 1024)))  # 100 MB
+MAX_DATASET_ROWS = int(os.getenv("MAX_DATASET_ROWS", "500000"))
+MAX_DATASET_COLUMNS = int(os.getenv("MAX_DATASET_COLUMNS", "500"))
+MAX_CSV_STRUCT_VALIDATE_ROWS = int(os.getenv("MAX_CSV_STRUCT_VALIDATE_ROWS", "25000"))
+MAX_SEMANTIC_SAMPLE_SIZE = int(os.getenv("MAX_SEMANTIC_SAMPLE_SIZE", "5000"))
+
 
 BOOLEAN_VALUES = {
     "true",
@@ -82,8 +89,9 @@ def detect_semantic_hints(series):
             or pd.api.types.is_string_dtype(series)
         )
     ):
+        sample_series = non_null if len(non_null) <= MAX_SEMANTIC_SAMPLE_SIZE else non_null.sample(MAX_SEMANTIC_SAMPLE_SIZE, random_state=42)
         parsed = pd.to_datetime(
-            non_null,
+            sample_series,
             format="mixed",
             errors="coerce"
         )
@@ -229,7 +237,8 @@ def detect_semantic_type(column_name, series):
         if any(needle in name for needle in needles) or any(needle.replace("_", "") in compact for needle in needles if len(needle) >= 4):
             # For date types, verify that non-empty values actually resemble dates, not relative text
             if semantic_type == "date_or_timestamp" and len(nonempty):
-                parsed_dates = pd.to_datetime(nonempty, format="mixed", errors="coerce")
+                sample_dates = nonempty if len(nonempty) <= MAX_SEMANTIC_SAMPLE_SIZE else nonempty.sample(MAX_SEMANTIC_SAMPLE_SIZE, random_state=42)
+                parsed_dates = pd.to_datetime(sample_dates, format="mixed", errors="coerce")
                 if parsed_dates.notna().mean() < 0.5:
                     continue
 
@@ -588,6 +597,12 @@ def detect_encoding_and_delimiter(file_path):
     if size == 0:
         raise ValueError(f"Input CSV file is empty: {file_path}")
 
+    if size > MAX_UPLOAD_SIZE_BYTES:
+        raise ValueError(
+            f"Input CSV file size ({size / (1024 * 1024):.1f} MB) exceeds maximum allowed limit "
+            f"of {MAX_UPLOAD_SIZE_BYTES / (1024 * 1024):.1f} MB: {file_path}"
+        )
+
     encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]
     valid_encoding = None
     sample_text = ""
@@ -665,6 +680,9 @@ def validate_csv_structure(file_path, encoding=None, delimiter=None):
                 reader,
                 start=2
             ):
+                if line_number > MAX_CSV_STRUCT_VALIDATE_ROWS:
+                    break
+
                 if not row or not any(str(field).strip() for field in row):
                     continue
 
@@ -750,6 +768,16 @@ def profile_dataset(file_path):
         raise ValueError(
             f"Input CSV file contains no data rows: "
             f"{file_path}"
+        )
+
+    if len(df) > MAX_DATASET_ROWS:
+        raise ValueError(
+            f"Dataset has {len(df):,} rows, exceeding maximum supported limit of {MAX_DATASET_ROWS:,} rows: {file_path}"
+        )
+
+    if df.shape[1] > MAX_DATASET_COLUMNS:
+        raise ValueError(
+            f"Dataset has {df.shape[1]} columns, exceeding maximum supported limit of {MAX_DATASET_COLUMNS} columns: {file_path}"
         )
 
     # Auto-repair blank or Unnamed columns so the dataset can be processed

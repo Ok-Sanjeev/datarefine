@@ -36,6 +36,10 @@ class BaseLLMProvider(ABC):
         self.api_key = api_key
         self.base_url = base_url
 
+    def __repr__(self) -> str:
+        key_status = "[CONFIGURED]" if self.api_key else "[NONE]"
+        return f"<{self.__class__.__name__}(model={self.model_name!r}, api_key={key_status})>"
+
     @property
     @abstractmethod
     def provider_name(self) -> str:

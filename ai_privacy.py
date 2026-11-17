@@ -8,8 +8,45 @@ Strict Privacy Mandate:
 """
 from __future__ import annotations
 
+import os
 import re
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Minimum sample size threshold to compute fine-grained numeric statistics (min, max, mean)
+# Sub-threshold datasets suppress statistics to prevent micro-data re-identification.
+MIN_SAMPLE_FOR_STATS = int(os.getenv("MIN_SAMPLE_FOR_STATS", "5"))
+
+# Sensitive column header patterns & classifications
+SENSITIVE_HEADER_PATTERNS = [
+    # Explicit PII embedded in header string
+    (re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"), "pii_email"),
+    (re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"), "pii_phone"),
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "government_id"),
+    # Clinical / Medical / Health Identifiers (supporting snake_case boundaries)
+    (re.compile(r"(?:^|_|[\s\W])(?:diagnosis|hiv|cancer|medical_condition|symptoms|prescription|biopsy|clinical_trial|disease_status)(?:$|_|[\s\W])", re.IGNORECASE), "medical"),
+    # National & Government Identification
+    (re.compile(r"(?:^|_|[\s\W])(?:ssn|national_id|passport_num|tax_id)(?:$|_|[\s\W])", re.IGNORECASE), "government_id"),
+    # Financial Account Numbers & Payment Cards
+    (re.compile(r"(?:^|_|[\s\W])(?:credit_card|bank_account|routing_number|iban|cvv)(?:$|_|[\s\W])", re.IGNORECASE), "financial"),
+    # Direct personal contact identifiers with explicit personal/customer prefixes
+    (re.compile(r"(?:^|_|[\s\W])(?:personal_email|customer_email_address|user_email_address)(?:$|_|[\s\W])", re.IGNORECASE), "contact_email"),
+    (re.compile(r"(?:^|_|[\s\W])(?:personal_phone|customer_phone|mobile_number)(?:$|_|[\s\W])", re.IGNORECASE), "contact_phone"),
+    # Explicit Individual Names combined with identifiers
+    (re.compile(r"(?:^|_|[\s\W])(?:patient_[a-zA-Z]+|employee_[a-zA-Z]+|client_[a-zA-Z]+|doctor_[a-zA-Z]+|full_name_of_[a-zA-Z]+)(?:$|_|[\s\W])", re.IGNORECASE), "name"),
+]
+
+
+def classify_and_sanitize_column_header(col_name: str, index: int) -> Tuple[str, bool]:
+    """
+    Inspect column name for sensitive PII, medical diagnoses, government identifiers, or personal names.
+    Returns: (outbound_name, is_sanitized)
+    """
+    raw = str(col_name).strip()
+    for pattern, category in SENSITIVE_HEADER_PATTERNS:
+        if pattern.search(raw):
+            sanitized_name = f"col_{index}_{category}"
+            return sanitized_name, True
+    return raw, False
 
 
 class PrivacyViolationError(ValueError):
@@ -142,36 +179,53 @@ def validate_outbound_payload(payload: Dict[str, Any]) -> None:
 
 
 def build_ai_safe_profile(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
-    """Return aggregate metadata only; keep original column names.
-
-    The second return value is retained for backward compatibility and is an
-    identity map (column name -> same column name).
-    """
+    """Return aggregate metadata only; sanitize sensitive column names and suppress small-dataset statistics."""
     source_columns = profile.get("column_profiles", {})
     safe_columns: dict[str, Any] = {}
+    token_to_column: dict[str, str] = {}
 
-    for original_name, raw_details in source_columns.items():
+    row_count = profile.get("rows")
+    suppress_small_sample_stats = (row_count is not None and row_count < MIN_SAMPLE_FOR_STATS)
+
+    for idx, (original_name, raw_details) in enumerate(source_columns.items()):
         details = raw_details if isinstance(raw_details, dict) else {}
         safe_details: dict[str, Any] = {}
         for key in _ALLOWED_DETAIL_KEYS:
             if key in details:
                 safe_details[key] = details[key]
 
-        # Numeric aggregate statistics only; never allow arbitrary text values.
-        stats = safe_details.get("statistics")
-        if isinstance(stats, dict):
-            safe_details["statistics"] = {
-                str(key): value for key, value in stats.items()
-                if isinstance(value, (int, float, bool)) or value is None
-            }
+        # 1. Small Sample Size Statistical Suppression (N < MIN_SAMPLE_FOR_STATS)
+        if suppress_small_sample_stats:
+            safe_details.pop("statistics", None)
+            safe_details.pop("category_count", None)
+            safe_details.pop("most_frequent_category_count", None)
+            safe_details.pop("inconsistent_category_count", None)
+        else:
+            stats = safe_details.get("statistics")
+            if isinstance(stats, dict):
+                safe_details["statistics"] = {
+                    str(key): value for key, value in stats.items()
+                    if isinstance(value, (int, float, bool)) or value is None
+                }
 
-        # A few frequency aggregates can help diagnose quality without exposing
-        # category labels. The profiler may provide this as separate fields.
-        for key in ("category_count", "most_frequent_category_count", "inconsistent_category_count"):
-            if key in details and isinstance(details[key], (int, float, bool)):
-                safe_details[key] = details[key]
+            for key in ("category_count", "most_frequent_category_count", "inconsistent_category_count"):
+                if key in details and isinstance(details[key], (int, float, bool)):
+                    safe_details[key] = details[key]
 
-        safe_columns[str(original_name)] = safe_details
+        # 2. Sensitive Column Header Sanitization
+        outbound_col_name, is_sanitized = classify_and_sanitize_column_header(str(original_name), idx)
+        safe_columns[outbound_col_name] = safe_details
+        token_to_column[outbound_col_name] = str(original_name)
+
+    privacy_notes = [
+        "Locally detected semantic types and aggregate structural metadata are included.",
+        "Zero raw cell values, sample rows, category label arrays, or value-frequency dictionaries are included.",
+    ]
+    if suppress_small_sample_stats:
+        privacy_notes.append(
+            f"Small dataset (rows={row_count} < {MIN_SAMPLE_FOR_STATS}) detected: "
+            "individual numeric statistics and category frequencies are suppressed to prevent cell value re-identification."
+        )
 
     safe_profile = {
         "rows": profile.get("rows"),
@@ -180,37 +234,45 @@ def build_ai_safe_profile(profile: dict[str, Any]) -> tuple[dict[str, Any], dict
         # Do not send original/suggested name pairs: they are unnecessary for planning.
         "column_name_issue_count": len(profile.get("column_name_issues", [])),
         "column_profiles": safe_columns,
-        "privacy_note": (
-            "Original column names and locally detected semantic types are included. "
-            "No cell values, sample rows, category labels, or value-frequency keys are included."
-        ),
+        "privacy_note": " ".join(privacy_notes),
     }
 
     # Centralized Outbound Privacy Verification
     validate_outbound_payload(safe_profile)
 
-    identity_map = {str(name): str(name) for name in source_columns}
-    return safe_profile, identity_map
+    return safe_profile, token_to_column
 
 
 def remap_plan_columns(plan_data: dict[str, Any], token_to_column: dict[str, str]) -> dict[str, Any]:
-    """Backward-compatible no-op for plans using original column names."""
+    """Remap sanitized column tokens back to original column names and repair casing mismatches."""
     actions = plan_data.get("actions", [])
     if not isinstance(actions, list):
         raise ValueError("Cleaning plan actions must be a list")
+
     valid_columns = list(token_to_column.values())
     exact_columns = set(valid_columns)
+
     for action in actions:
         if not isinstance(action, dict):
             raise ValueError("Each cleaning action must be an object")
+
         column = action.get("column")
-        if column is None or not valid_columns or column in exact_columns:
+        if column is None:
             continue
-        # Safely repair casing-only mismatches (e.g. join_date -> Join_Date),
-        # but never guess when the match is ambiguous or materially different.
+
+        # 1. Remap sanitized token if present (e.g. col_0_medical -> Patient_John_Doe_Diagnosis)
+        if column in token_to_column:
+            column = token_to_column[column]
+            action["column"] = column
+
+        if not valid_columns or column in exact_columns:
+            continue
+
+        # 2. Safely repair casing-only mismatches (e.g. join_date -> Join_Date)
         matches = [name for name in valid_columns if str(name).casefold() == str(column).casefold()]
         if len(matches) == 1:
             action["column"] = matches[0]
         else:
             raise ValueError(f"The AI referenced unknown column '{column}' or an ambiguous casing match. No repair was performed.")
+
     return plan_data

@@ -1,0 +1,140 @@
+{
+  "timestamp": "2026-11-17 19:51:50",
+  "hardware": {
+    "cpu_cores": 12
+  },
+  "datasets": {
+    "Small": {
+      "rows": 1000,
+      "columns": 12,
+      "file_size_mb": 0.13,
+      "profiling": {
+        "duration_seconds": 1.09,
+        "throughput_rows_per_sec": 917.4,
+        "peak_memory_mb": 0.38
+      },
+      "checkpoints": {
+        "total_checkpoints": 11,
+        "in_memory_cached_dfs": 3,
+        "apply_10_actions_duration_s": 0.105,
+        "peak_memory_mb": 0.71
+      },
+      "undo_redo": {
+        "5_undo_5_redo_duration_s": 0.089,
+        "peak_memory_mb": 0.61
+      },
+      "clustering": {
+        "fingerprint": {
+          "duration_seconds": 0.001,
+          "clusters_found": 2,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "metaphone": {
+          "duration_seconds": 0.001,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "levenshtein": {
+          "duration_seconds": 0.001,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        }
+      },
+      "grel": {
+        "duration_seconds": 0.082,
+        "throughput_rows_per_sec": 12195.1
+      }
+    },
+    "Medium": {
+      "rows": 10000,
+      "columns": 12,
+      "file_size_mb": 1.32,
+      "profiling": {
+        "duration_seconds": 6.213,
+        "throughput_rows_per_sec": 1609.5,
+        "peak_memory_mb": 3.4
+      },
+      "checkpoints": {
+        "total_checkpoints": 11,
+        "in_memory_cached_dfs": 3,
+        "apply_10_actions_duration_s": 0.194,
+        "peak_memory_mb": 1.23
+      },
+      "undo_redo": {
+        "5_undo_5_redo_duration_s": 0.074,
+        "peak_memory_mb": 0.57
+      },
+      "clustering": {
+        "fingerprint": {
+          "duration_seconds": 0.002,
+          "clusters_found": 2,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "metaphone": {
+          "duration_seconds": 0.001,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "levenshtein": {
+          "duration_seconds": 0.002,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        }
+      },
+      "grel": {
+        "duration_seconds": 0.789,
+        "throughput_rows_per_sec": 12674.3
+      }
+    },
+    "Large": {
+      "rows": 50000,
+      "columns": 12,
+      "file_size_mb": 6.73,
+      "profiling": {
+        "duration_seconds": 19.889,
+        "throughput_rows_per_sec": 2514.0,
+        "peak_memory_mb": 17.0
+      },
+      "checkpoints": {
+        "total_checkpoints": 11,
+        "in_memory_cached_dfs": 3,
+        "apply_10_actions_duration_s": 0.581,
+        "peak_memory_mb": 5.8
+      },
+      "undo_redo": {
+        "5_undo_5_redo_duration_s": 0.101,
+        "peak_memory_mb": 2.67
+      },
+      "clustering": {
+        "fingerprint": {
+          "duration_seconds": 0.004,
+          "clusters_found": 2,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "metaphone": {
+          "duration_seconds": 0.003,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        },
+        "levenshtein": {
+          "duration_seconds": 0.004,
+          "clusters_found": 3,
+          "evaluated_unique": 10,
+          "truncated": false
+        }
+      },
+      "grel": {
+        "duration_seconds": 5.392,
+        "throughput_rows_per_sec": 9273.0
+      }
+    }
+  }
+}

@@ -12,16 +12,26 @@ import re
 import secrets
 import shutil
 import uuid
+import hmac
 from datetime import datetime
 from pathlib import Path
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from rate_limiter import enforce_ai_rate_limits, enforce_global_rate_limit, limiter
+from security_utils import (
+    SecurityHeadersMiddleware,
+    sanitize_secret_strings,
+    validate_cors_origins,
+)
 
 from actions import execute_action
 from ai_privacy import build_ai_safe_profile
@@ -74,20 +84,49 @@ BASE_DIR = Path(__file__).resolve().parent
 ALLOWED_DATA_DIRS = [
     (BASE_DIR / "data").resolve(),
     (BASE_DIR / "data" / "uploads").resolve(),
+    (BASE_DIR / "data" / "sessions").resolve(),
     (BASE_DIR / "data" / "benchmark").resolve(),
     (BASE_DIR / "data" / "robustness_tests").resolve(),
 ]
 
-MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
-MAX_DATASET_ROWS = 500_000
-MAX_DATASET_COLUMNS = 500
-SESSION_MAX_AGE_SECONDS = 4 * 3600  # 4 hours
-MAX_ACTIVE_SESSIONS = 50
+MAX_UPLOAD_SIZE_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(100 * 1024 * 1024)))  # 100 MB default
+MAX_DATASET_ROWS = int(os.getenv("MAX_DATASET_ROWS", "500000"))
+MAX_DATASET_COLUMNS = int(os.getenv("MAX_DATASET_COLUMNS", "500"))
+SESSION_MAX_AGE_SECONDS = int(os.getenv("SESSION_MAX_AGE_SECONDS", str(4 * 3600)))  # 4 hours
+MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "50"))
+MAX_CONCURRENT_HEAVY_OPS = int(os.getenv("MAX_CONCURRENT_HEAVY_OPS", "8"))
 
-# Standards-compliant CORS configuration
-ALLOWED_ORIGINS = [orig.strip() for orig in os.getenv("ALLOWED_ORIGINS", "*").split(",") if orig.strip()]
-ALLOW_CREDENTIALS = True if "*" not in ALLOWED_ORIGINS else False
+heavy_ops_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_HEAVY_OPS)
 
+
+@contextmanager
+def heavy_operation_slot(timeout: float = 10.0):
+    """
+    Guards CPU- and AI-intensive endpoints from resource exhaustion under concurrent loads.
+    Raises HTTP 503 if all concurrency slots are saturated.
+    """
+    acquired = heavy_ops_semaphore.acquire(timeout=timeout)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: Heavy computation concurrency limit reached. Please retry shortly.",
+        )
+    try:
+        yield
+    finally:
+        heavy_ops_semaphore.release()
+
+# Standards-compliant, environment-aware CORS configuration
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+ALLOWED_ORIGINS, ALLOW_CREDENTIALS = validate_cors_origins(
+    origins_str=os.getenv("ALLOWED_ORIGINS"),
+    environment=ENVIRONMENT,
+)
+
+# 1. Security Response Headers Middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# 2. CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -96,22 +135,137 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store for active cleaning sessions
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+@app.middleware("http")
+async def rate_limiting_middleware(request: Request, call_next):
+    """Enforce global IP rate limits on all /api/* routes except health check."""
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/health":
+        enforce_global_rate_limit(request)
+    response = await call_next(request)
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_secret_sanitizer(request: Request, exc: HTTPException):
+    """Ensure HTTP error messages never expose API keys or internal credential secrets."""
+    clean_detail = sanitize_secret_strings(exc.detail) if isinstance(exc.detail, str) else exc.detail
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": clean_detail},
+        headers=exc.headers,
+    )
+
+from session_store import (
+    PersistentSessionStore,
+    conceal_absolute_path,
+    get_session_storage_dir,
+    get_uploads_storage_dir,
+)
+from auth_store import (
+    AuthStore,
+    hash_password,
+    verify_password,
+    validate_password_strength,
+)
+
+# Production Persistent Session Store & User Account Store (Shared WAL Database)
+SESSIONS = PersistentSessionStore()
+AUTH_STORE = AuthStore(db_path=SESSIONS.db_path)
+
+# Google OAuth Configuration (Optional, activated when environment variables are supplied)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")
+
+# Demo Mode vs Authenticated Multi-Tenant Resource Limits
+MAX_DEMO_UPLOAD_SIZE_BYTES = int(os.getenv("MAX_DEMO_UPLOAD_SIZE_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+MAX_DEMO_DATASET_ROWS = int(os.getenv("MAX_DEMO_DATASET_ROWS", "10000"))  # 10k rows
+DEMO_SESSION_MAX_AGE_SECONDS = int(os.getenv("DEMO_SESSION_MAX_AGE_SECONDS", "3600"))  # 1 hour
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(STATIC_DIR):
     from fastapi.staticfiles import StaticFiles
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-UPLOAD_DIR = os.path.join("data", "uploads")
+UPLOAD_DIR = str(get_uploads_storage_dir())
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "demo"), exist_ok=True)
 
 
-def resolve_safe_dataset_path(client_path: str) -> Path:
+def set_auth_cookies(response: Optional[Response], token: str) -> None:
+    """Set secure, HttpOnly, SameSite=Lax authentication cookie and double-submit CSRF token."""
+    if not response:
+        return
+    is_prod = os.getenv("ENVIRONMENT", "development").lower() == "production"
+    cookie_max_age = int(os.getenv("AUTH_TOKEN_EXPIRE_SECONDS", str(72 * 3600)))
+    csrf_token = secrets.token_hex(16)
+    response.set_cookie(
+        key="auth_token",
+        value=token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=cookie_max_age,
+        path="/",
+    )
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        httponly=False,
+        secure=is_prod,
+        samesite="lax",
+        max_age=cookie_max_age,
+        path="/",
+    )
+
+
+def get_current_user_optional(request: Optional[Request]) -> Optional[Dict[str, Any]]:
     """
-    Safely resolve a client-supplied dataset filepath.
-    Enforces strict confinement to approved dataset directories.
-    Prevents path traversal, arbitrary file reading, and invalid extensions.
+    Extract authenticated user profile from Authorization Bearer token or HttpOnly cookie.
+    Enforces double-submit CSRF token validation when authenticating via ambient browser cookies.
+    """
+    if not request:
+        return None
+    token = None
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif "auth_token" in request.cookies:
+        # Authenticating via ambient browser cookie: protect against CSRF on state-changing methods
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            csrf_cookie = request.cookies.get("csrf_token")
+            csrf_header = request.headers.get("x-csrf-token") or request.headers.get("X-CSRF-Token")
+            if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Forbidden: CSRF token missing or invalid for cookie-authenticated request."
+                )
+        token = request.cookies.get("auth_token")
+
+    if token:
+        return AUTH_STORE.validate_auth_token(token)
+    return None
+
+
+def get_current_user(request: Request) -> Dict[str, Any]:
+    """Require an authenticated user. Raises HTTP 401 if unauthenticated."""
+    user = get_current_user_optional(request)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please log in or register to access this resource."
+        )
+    if user.get("status") != "active":
+        raise HTTPException(status_code=403, detail="Account is suspended or inactive.")
+    return user
+
+
+def resolve_safe_dataset_path(client_path: str, user_id: Optional[str] = None) -> Path:
+    """
+    Safely resolve a client-supplied dataset filepath with multi-tenant isolation.
+    Enforces strict confinement to approved dataset directories and ensures
+    authenticated users cannot access other users' isolated upload directories.
     """
     if not client_path or not isinstance(client_path, str):
         raise HTTPException(status_code=400, detail="Invalid filepath provided.")
@@ -122,6 +276,8 @@ def resolve_safe_dataset_path(client_path: str) -> Path:
     raw_path = Path(client_path.strip())
     if not raw_path.is_absolute():
         resolved_path = (BASE_DIR / raw_path).resolve()
+        if not resolved_path.exists() and (BASE_DIR / "data" / raw_path).exists():
+            resolved_path = (BASE_DIR / "data" / raw_path).resolve()
     else:
         resolved_path = raw_path.resolve()
 
@@ -141,6 +297,21 @@ def resolve_safe_dataset_path(client_path: str) -> Path:
             detail="Access forbidden: Path traverses outside approved data directories."
         )
 
+    # Multi-tenant isolation: check ownership if inside uploads/
+    uploads_root = (BASE_DIR / "data" / "uploads").resolve()
+    try:
+        rel_upload = resolved_path.relative_to(uploads_root)
+        if len(rel_upload.parts) > 1:
+            owner_subfolder = rel_upload.parts[0]
+            if owner_subfolder != "demo":
+                if not user_id or user_id != owner_subfolder:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Forbidden: You do not have permission to access another user's uploaded dataset."
+                    )
+    except ValueError:
+        pass
+
     if not resolved_path.exists() or not resolved_path.is_file():
         raise HTTPException(status_code=404, detail=f"Dataset file not found: {client_path}")
 
@@ -159,24 +330,69 @@ def sanitize_filename(filename: str) -> str:
     return sanitized
 
 
-def _cleanup_stale_sessions() -> None:
-    """Prune expired sessions to prevent unbounded memory growth."""
-    now = datetime.now().timestamp()
-    expired = []
-    for sid, sdata in SESSIONS.items():
-        created_time = sdata.get("created_timestamp", now)
-        if now - created_time > SESSION_MAX_AGE_SECONDS:
-            expired.append(sid)
-    for sid in expired:
-        SESSIONS.pop(sid, None)
-
-    if len(SESSIONS) > MAX_ACTIVE_SESSIONS:
-        sorted_sessions = sorted(
-            SESSIONS.items(),
-            key=lambda item: item[1].get("created_timestamp", 0)
+def get_authenticated_session(
+    session_id: str,
+    request: Optional[Request] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Validate session existence, check expiration, and verify ownership token or user identity.
+    Enforces multi-tenant isolation so authenticated users can only access their own sessions,
+    while anonymous demo visitors can access demo sessions with their session token.
+    """
+    session = SESSIONS.get_session(session_id, touch=True)
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found or expired. Please profile your dataset again."
         )
-        for sid, _ in sorted_sessions[:len(SESSIONS) - MAX_ACTIVE_SESSIONS]:
-            SESSIONS.pop(sid, None)
+
+    owner_id = session.get("owner_id", "anonymous")
+    current_user = get_current_user_optional(request)
+
+    # 1. Authenticated User Session Ownership Check
+    if owner_id and owner_id.startswith("usr_"):
+        if not current_user:
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized: Authentication required to access this user session."
+            )
+        if current_user["id"] != owner_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: You do not have permission to access another user's session."
+            )
+        return session
+
+    # 2. Anonymous / Demo Session Verification
+    provided_token = token
+    if not provided_token and request:
+        provided_token = (
+            request.headers.get("x-session-token")
+            or request.headers.get("X-Session-Token")
+            or request.query_params.get("session_token")
+            or request.query_params.get("token")
+        )
+        if not provided_token:
+            auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                candidate = auth_header[7:].strip()
+                if SESSIONS.verify_token(session_id, candidate):
+                    provided_token = candidate
+
+    if provided_token:
+        if not SESSIONS.verify_token(session_id, provided_token):
+            raise HTTPException(status_code=403, detail="Forbidden: Invalid session access token.")
+    else:
+        if os.getenv("REQUIRE_SESSION_TOKEN", "false").lower() in ("true", "1"):
+            raise HTTPException(status_code=401, detail="Unauthorized: X-Session-Token header required.")
+
+    return session
+
+
+def _cleanup_stale_sessions() -> None:
+    """Prune expired sessions, isolated checkpoints, and orphaned uploads."""
+    SESSIONS.purge_expired_sessions()
 
 
 # ============================================================
@@ -416,7 +632,7 @@ class PlanRequest(BaseModel):
     session_id: str
     provider: Optional[str] = "gemini"
     model: Optional[str] = None
-    api_key: Optional[str] = None
+    api_key: Optional[str] = Field(default=None, repr=False)
     base_url: Optional[str] = None
 
 
@@ -444,8 +660,371 @@ class EvaluateRequest(BaseModel):
 
 
 # ============================================================
+# AUTHENTICATION & MULTI-TENANT USER ACCOUNT MODELS
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class GoogleCallbackRequest(BaseModel):
+    code: str
+    state: str
+    redirect_uri: Optional[str] = None
+
+
+class GoogleTokenRequest(BaseModel):
+    credential: Optional[str] = None
+    id_token: Optional[str] = None
+
+
+class UpdatePreferencesRequest(BaseModel):
+    theme: Optional[str] = None
+    preferred_provider: Optional[str] = None
+    preferred_model: Optional[str] = None
+    custom_api_key: Optional[str] = None
+    clear_api_key: Optional[bool] = False
+
+
+class ClaimSessionRequest(BaseModel):
+    session_id: str
+    session_token: Optional[str] = None
+
+
+# ============================================================
 # REST API ENDPOINTS
 # ============================================================
+
+# --- Authentication & Account Routes ---
+
+@app.post("/api/auth/register")
+def api_register(req: RegisterRequest, request: Request = None, response: Response = None):
+    """Register a new user account with Argon2id password hashing."""
+    try:
+        user = AUTH_STORE.register_user(
+            email=req.email,
+            password=req.password,
+            full_name=req.full_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    client_ip = limiter.get_client_ip(request) if request else None
+    user_agent = request.headers.get("user-agent") if request else None
+    token = AUTH_STORE.create_auth_token(user["id"], user_agent=user_agent, ip_address=client_ip)
+    set_auth_cookies(response, token)
+
+    return {
+        "status": "success",
+        "message": "User registered successfully.",
+        "user": user,
+        "token": token,
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/api/auth/login")
+def api_login(req: LoginRequest, request: Request = None, response: Response = None):
+    """Authenticate with email and password and issue a 256-bit Bearer auth token."""
+    user = AUTH_STORE.authenticate_email_password(req.email, req.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    client_ip = limiter.get_client_ip(request) if request else None
+    user_agent = request.headers.get("user-agent") if request else None
+    token = AUTH_STORE.create_auth_token(user["id"], user_agent=user_agent, ip_address=client_ip)
+    set_auth_cookies(response, token)
+
+    return {
+        "status": "success",
+        "message": "Login successful.",
+        "user": user,
+        "token": token,
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/api/auth/logout")
+def api_logout(request: Request, response: Response = None):
+    """Revoke active user Bearer token and clear session cookies."""
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif "auth_token" in request.cookies:
+        token = request.cookies.get("auth_token")
+
+    if token:
+        AUTH_STORE.revoke_auth_token(token)
+
+    if response:
+        response.delete_cookie(key="auth_token", path="/")
+        response.delete_cookie(key="csrf_token", path="/")
+    return {"status": "success", "message": "Logged out successfully."}
+
+
+@app.post("/api/session/claim")
+def api_claim_session(req: ClaimSessionRequest, request: Request):
+    """
+    Adopt an anonymous guest demo session into the logged-in user account.
+    Requires possession of the session token to prevent unauthorized session hijacking.
+    """
+    user = get_current_user(request)
+    success = SESSIONS.reassign_session_owner(
+        session_id=req.session_id,
+        new_owner_id=user["id"],
+        session_token=req.session_token,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Cannot claim session. It may be owned by another user or the token is invalid."
+        )
+    return {
+        "status": "success",
+        "message": "Demo session successfully adopted into your account.",
+        "session_id": req.session_id,
+        "owner_id": user["id"],
+    }
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    """Return current authenticated user profile or anonymous status."""
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        user = get_current_user_optional(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked authentication token.")
+        return {"authenticated": True, "user": user, "email": user["email"]}
+    user = get_current_user_optional(request)
+    if user:
+        return {"authenticated": True, "user": user, "email": user["email"]}
+    return {"authenticated": False, "user": None, "mode": "demo"}
+
+
+@app.post("/api/auth/password-reset/request")
+def api_password_reset_request(req: PasswordResetRequest):
+    """Initiate password reset workflow."""
+    reset_token = AUTH_STORE.create_password_reset_token(req.email)
+    resp: Dict[str, Any] = {
+        "status": "success",
+        "message": "If an account exists with this email, password reset instructions have been dispatched.",
+    }
+    if os.getenv("ENVIRONMENT", "development").lower() != "production" and reset_token:
+        resp["reset_token"] = reset_token
+        resp["dev_reset_token"] = reset_token
+    return resp
+
+
+@app.post("/api/auth/password-reset/confirm")
+def api_password_reset_confirm(req: PasswordResetConfirmRequest):
+    """Complete password reset using token and revoke previous tokens."""
+    try:
+        success = AUTH_STORE.reset_password_with_token(req.token, req.new_password)
+        if not success:
+            raise HTTPException(status_code=400, detail="Invalid, expired, or previously used reset token.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success", "message": "Password updated successfully. Please log in with your new password."}
+
+
+@app.get("/api/auth/google/url")
+def api_google_auth_url(redirect_uri: Optional[str] = None):
+    """Return Google OAuth 2.0 URL with state parameter or 503 if not configured."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured on this server.")
+    state = AUTH_STORE.create_oauth_state()
+    cb_uri = redirect_uri or GOOGLE_REDIRECT_URI
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "redirect_uri": cb_uri,
+        "state": state,
+        "access_type": "online",
+        "prompt": "select_account",
+    }
+    from urllib.parse import urlencode
+    return {
+        "configured": True,
+        "auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}",
+        "client_id": GOOGLE_CLIENT_ID,
+        "state": state,
+    }
+
+
+@app.post("/api/auth/google/callback")
+def api_google_callback(req: GoogleCallbackRequest, request: Request = None, response: Response = None):
+    """Exchange Google OAuth code for tokens, verify ID token, and create/link account."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=501, detail="Google OAuth is not configured on this server.")
+
+    if not AUTH_STORE.validate_and_consume_oauth_state(req.state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state parameter (potential CSRF).")
+
+    cb_uri = req.redirect_uri or GOOGLE_REDIRECT_URI
+    token_url = "https://oauth2.googleapis.com/token"
+    token_payload = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "code": req.code,
+        "grant_type": "authorization_code",
+        "redirect_uri": cb_uri,
+    }
+
+    try:
+        import requests as py_requests
+        resp = py_requests.post(token_url, data=token_payload, timeout=10.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Google token exchange failed: {resp.text}")
+        token_data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Google token exchange network failure: {e}")
+
+    id_token_jwt = token_data.get("id_token")
+    if not id_token_jwt:
+        raise HTTPException(status_code=400, detail="Google did not return an ID token.")
+
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        id_info = google_id_token.verify_oauth2_token(
+            id_token_jwt,
+            google_requests.Request(),
+            audience=GOOGLE_CLIENT_ID,
+        )
+        if id_info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+            raise HTTPException(status_code=400, detail="Invalid ID token issuer.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Google ID token validation failed: {e}")
+
+    google_id = id_info.get("sub")
+    email = id_info.get("email")
+    name = id_info.get("name")
+    picture = id_info.get("picture")
+
+    if not google_id or not email:
+        raise HTTPException(status_code=400, detail="Missing required identity claims from Google.")
+
+    user = AUTH_STORE.upsert_google_user(
+        google_id=google_id,
+        email=email,
+        full_name=name,
+        avatar_url=picture,
+    )
+
+    client_ip = limiter.get_client_ip(request) if request else None
+    user_agent = request.headers.get("user-agent") if request else None
+    auth_token = AUTH_STORE.create_auth_token(user["id"], user_agent=user_agent, ip_address=client_ip)
+    set_auth_cookies(response, auth_token)
+
+    return {
+        "status": "success",
+        "token": auth_token,
+        "access_token": auth_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.post("/api/auth/google/token")
+def api_google_token_login(req: GoogleTokenRequest, request: Request = None, response: Response = None):
+    """Authenticate directly using a Google Identity Services (One-Tap) ID token."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=501, detail="Google OAuth is not configured on this server.")
+
+    token_str = req.credential or req.id_token
+    if not token_str:
+        raise HTTPException(status_code=400, detail="Missing Google ID token credential.")
+
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        id_info = google_id_token.verify_oauth2_token(
+            token_str,
+            google_requests.Request(),
+            audience=GOOGLE_CLIENT_ID,
+        )
+        if id_info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+            raise HTTPException(status_code=400, detail="Invalid ID token issuer.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Google ID token: {e}")
+
+    google_id = id_info.get("sub")
+    email = id_info.get("email")
+    name = id_info.get("name")
+    picture = id_info.get("picture")
+
+    if not google_id or not email:
+        raise HTTPException(status_code=400, detail="Incomplete identity claims in Google token.")
+
+    user = AUTH_STORE.upsert_google_user(
+        google_id=google_id,
+        email=email,
+        full_name=name,
+        avatar_url=picture,
+    )
+
+    client_ip = limiter.get_client_ip(request) if request else None
+    user_agent = request.headers.get("user-agent") if request else None
+    auth_token = AUTH_STORE.create_auth_token(user["id"], user_agent=user_agent, ip_address=client_ip)
+    set_auth_cookies(response, auth_token)
+
+    return {
+        "status": "success",
+        "token": auth_token,
+        "access_token": auth_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.get("/api/user/preferences")
+def api_get_preferences(request: Request):
+    """Get account-level preferences for current authenticated user."""
+    user = get_current_user(request)
+    prefs = AUTH_STORE.get_user_preferences(user["id"])
+    return {"status": "success", "preferences": prefs}
+
+
+@app.put("/api/user/preferences")
+@app.post("/api/user/preferences")
+def api_update_preferences(req: UpdatePreferencesRequest, request: Request):
+    """Update account-level preferences. Custom API keys are encrypted at rest."""
+    user = get_current_user(request)
+    updated_prefs = AUTH_STORE.update_user_preferences(
+        user["id"],
+        req.model_dump(exclude_unset=True),
+    )
+    return {"status": "success", "preferences": updated_prefs}
+
+
+@app.get("/api/user/sessions")
+def api_get_user_sessions(request: Request):
+    """List active cleaning sessions owned by the current authenticated user."""
+    user = get_current_user(request)
+    sessions = SESSIONS.list_user_sessions(user["id"])
+    return {"status": "success", "sessions": sessions}
+
 
 @app.get("/api/health")
 def get_health():
@@ -460,11 +1039,20 @@ def get_health():
 
 
 @app.get("/api/datasets")
-def list_datasets():
-    """Discover available CSV datasets in data/ and data/benchmark/."""
+def list_datasets(request: Request = None):
+    """Discover available CSV datasets with multi-tenant isolation."""
+    current_user = get_current_user_optional(request)
+    user_id = current_user["id"] if current_user else None
+
     datasets = []
     base_data = "data"
-    for root, _, files in os.walk(base_data):
+    uploads_dir = os.path.join(base_data, "uploads")
+    sessions_dir = os.path.join(base_data, "sessions")
+
+    # 1. Base data files (excluding uploads and sessions)
+    for root, dirs, files in os.walk(base_data):
+        # Exclude uploads/ and sessions/ from general walk
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in (uploads_dir, sessions_dir)]
         for f in files:
             if f.endswith(".csv") and not f.startswith("cleaned_"):
                 full_path = os.path.join(root, f)
@@ -479,19 +1067,68 @@ def list_datasets():
                     })
                 except Exception:
                     pass
+
+    # 2. User-specific uploads or demo uploads
+    allowed_subfolders = ["demo"]
+    if user_id:
+        allowed_subfolders.append(user_id)
+
+    if os.path.exists(uploads_dir):
+        # Direct files in uploads/ (backwards compat)
+        for f in os.listdir(uploads_dir):
+            full_path = os.path.join(uploads_dir, f)
+            if os.path.isfile(full_path) and f.endswith(".csv") and not f.startswith("cleaned_"):
+                rel_path = os.path.relpath(full_path, start=".")
+                try:
+                    size_kb = round(os.path.getsize(full_path) / 1024, 1)
+                    datasets.append({
+                        "name": f,
+                        "path": rel_path.replace("\\", "/"),
+                        "size_kb": size_kb,
+                        "is_benchmark": False,
+                    })
+                except Exception:
+                    pass
+
+        # Subfolders
+        for sub in allowed_subfolders:
+            sub_dir = os.path.join(uploads_dir, sub)
+            if os.path.exists(sub_dir) and os.path.isdir(sub_dir):
+                for f in os.listdir(sub_dir):
+                    full_path = os.path.join(sub_dir, f)
+                    if os.path.isfile(full_path) and f.endswith(".csv") and not f.startswith("cleaned_"):
+                        rel_path = os.path.relpath(full_path, start=".")
+                        try:
+                            size_kb = round(os.path.getsize(full_path) / 1024, 1)
+                            datasets.append({
+                                "name": f,
+                                "path": rel_path.replace("\\", "/"),
+                                "size_kb": size_kb,
+                                "is_benchmark": False,
+                            })
+                        except Exception:
+                            pass
+
     return {"datasets": sorted(datasets, key=lambda d: (not d["is_benchmark"], d["name"]))}
 
 
 @app.post("/api/upload")
-async def upload_dataset(file: UploadFile = File(...)):
-    """Upload a CSV dataset with strict size, filename, and format security validation."""
+async def upload_dataset(file: UploadFile = File(...), request: Request = None):
+    """Upload a CSV dataset with strict size, filename, format, and multi-tenant security validation."""
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files (.csv) are supported.")
+
+    current_user = get_current_user_optional(request)
+    user_subfolder = current_user["id"] if current_user else "demo"
+    max_upload_size = MAX_UPLOAD_SIZE_BYTES if current_user else MAX_DEMO_UPLOAD_SIZE_BYTES
+
+    target_dir = Path(UPLOAD_DIR) / user_subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(file.filename)
     file_id = secrets.token_hex(6)
     dest_filename = f"{file_id}_{safe_name}"
-    dest_path = (Path(UPLOAD_DIR) / dest_filename).resolve()
+    dest_path = (target_dir / dest_filename).resolve()
 
     bytes_read = 0
     chunk_size = 1024 * 1024  # 1 MB chunk
@@ -502,13 +1139,15 @@ async def upload_dataset(file: UploadFile = File(...)):
                 if not chunk:
                     break
                 bytes_read += len(chunk)
-                if bytes_read > MAX_UPLOAD_SIZE_BYTES:
+                if bytes_read > max_upload_size:
                     buffer.close()
                     if dest_path.exists():
                         dest_path.unlink()
+                    limit_mb = max_upload_size // (1024 * 1024)
+                    user_hint = "" if current_user else " (demo mode limit). Sign in for higher upload limits."
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Uploaded file exceeds maximum allowed size ({MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB)."
+                        detail=f"Uploaded file exceeds maximum allowed size ({limit_mb}MB){user_hint}."
                     )
                 buffer.write(chunk)
     except HTTPException:
@@ -524,6 +1163,8 @@ async def upload_dataset(file: UploadFile = File(...)):
         if sample_df.empty and sample_df.columns.empty:
             dest_path.unlink()
             raise HTTPException(status_code=400, detail="Uploaded CSV file is empty.")
+    except HTTPException:
+        raise
     except Exception as err:
         if dest_path.exists():
             dest_path.unlink()
@@ -535,11 +1176,12 @@ async def upload_dataset(file: UploadFile = File(...)):
         "filepath": rel_path,
         "filename": safe_name,
         "size_bytes": bytes_read,
+        "owner_id": user_subfolder,
     }
 
 
 @app.post("/api/profile")
-def api_profile(req: ProfileRequest):
+def api_profile(req: ProfileRequest, request: Request = None):
     """Profile a dataset, compute distributions, and initialize session state."""
     filepath_str = req.filepath
     if not filepath_str and req.session_id and req.session_id in SESSIONS:
@@ -548,19 +1190,27 @@ def api_profile(req: ProfileRequest):
     if not filepath_str:
         raise HTTPException(status_code=400, detail="Filepath or active session_id is required.")
 
-    # Validate and securely resolve path within approved dataset directories
-    safe_path = resolve_safe_dataset_path(filepath_str)
+    current_user = get_current_user_optional(request)
+    user_id = current_user["id"] if current_user else None
 
-    try:
-        df, profile = profile_dataset(str(safe_path))
-    except Exception as err:
-        raise HTTPException(status_code=400, detail=f"Profiling failed: {err}")
+    # Validate and securely resolve path within approved dataset directories
+    safe_path = resolve_safe_dataset_path(filepath_str, user_id=user_id)
+
+    with heavy_operation_slot():
+        try:
+            df, profile = profile_dataset(str(safe_path))
+        except Exception as err:
+            raise HTTPException(status_code=400, detail=f"Profiling failed: {err}")
 
     # Enforce row and column safety limits
-    if len(df) > MAX_DATASET_ROWS:
+    is_uploaded_file = "uploads" in safe_path.parts
+    max_rows = MAX_DATASET_ROWS if (current_user or not is_uploaded_file) else MAX_DEMO_DATASET_ROWS
+    if len(df) > max_rows:
+        limit_desc = f"{max_rows:,}"
+        user_hint = "" if current_user else " in demo mode. Sign in for higher capacity."
         raise HTTPException(
             status_code=400,
-            detail=f"Dataset has {len(df):,} rows, exceeding maximum supported limit of {MAX_DATASET_ROWS:,} rows."
+            detail=f"Dataset has {len(df):,} rows, exceeding maximum supported limit of {limit_desc} rows{user_hint}."
         )
     if len(df.columns) > MAX_DATASET_COLUMNS:
         raise HTTPException(
@@ -571,30 +1221,34 @@ def api_profile(req: ProfileRequest):
     _cleanup_stale_sessions()
 
     session_id = req.session_id or str(uuid.uuid4())
-    session_token = secrets.token_urlsafe(32)
+    session_token = secrets.token_hex(32)
     run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = os.path.join("runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
 
-    cleaning_session = CleaningSession(df.copy(deep=True))
+    cleaning_session = CleaningSession(df.copy(deep=True), session_name=safe_path.stem)
     distributions = compute_column_distributions(df)
 
-    # Save to session cache
-    SESSIONS[session_id] = {
-        "session_id": session_id,
-        "session_token": session_token,
-        "created_timestamp": datetime.now().timestamp(),
-        "run_id": run_id,
-        "run_dir": run_dir,
-        "filepath": str(safe_path),
-        "df_original": df.copy(deep=True),
-        "df_current": df.copy(deep=True),
-        "profile": profile,
-        "cleaning_session": cleaning_session,
-        "plan": None,
-        "executed_actions": [],
-        "report": None,
-    }
+    owner_id = current_user["id"] if current_user else "anonymous"
+    session_max_age = (
+        int(os.getenv("SESSION_MAX_AGE_SECONDS", "86400"))
+        if current_user
+        else DEMO_SESSION_MAX_AGE_SECONDS
+    )
+
+    # Save to persistent session store
+    SESSIONS.create_session(
+        session_id=session_id,
+        df=df,
+        filepath=str(safe_path),
+        profile=profile,
+        cleaning_session=cleaning_session,
+        session_token=session_token,
+        owner_id=owner_id,
+        run_id=run_id,
+        run_dir=run_dir,
+        max_age_seconds=session_max_age,
+    )
 
     # Format column preview list
     col_profiles = profile.get("column_profiles", {})
@@ -628,7 +1282,8 @@ def api_profile(req: ProfileRequest):
 
     return {
         "session_id": session_id,
-        "filepath": str(safe_path).replace("\\", "/"),
+        "session_token": session_token,
+        "filepath": conceal_absolute_path(safe_path),
         "dataset_name": safe_path.name,
         "summary": {
             "rows": len(df),
@@ -657,12 +1312,22 @@ def api_actions_registry():
 
 
 @app.post("/api/plan")
-def api_plan(req: PlanRequest):
+def api_plan(req: PlanRequest, request: Request = None):
     """Generate a privacy-safe cleaning plan using the requested LLM provider."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found. Profile a dataset first.")
+    # Retrieve user preference key if not explicitly provided in the request
+    current_user = get_current_user_optional(request)
+    api_key_to_use = req.api_key
+    if not api_key_to_use and current_user:
+        saved_key = AUTH_STORE.get_decrypted_user_api_key(current_user["id"])
+        if saved_key:
+            api_key_to_use = saved_key
 
-    session = SESSIONS[req.session_id]
+    # 1. Enforce AI rate limiting and server key protection policy
+    has_custom_key = bool(api_key_to_use and api_key_to_use.strip())
+    if request is not None:
+        enforce_ai_rate_limits(request=request, has_custom_key=has_custom_key)
+
+    session = get_authenticated_session(req.session_id, request)
     profile = session["profile"]
     df = session["df_original"]
 
@@ -674,7 +1339,7 @@ def api_plan(req: PlanRequest):
         provider = get_llm_provider(
             provider_name=req.provider,
             model_name=req.model,
-            api_key=req.api_key,
+            api_key=api_key_to_use,
             base_url=req.base_url,
         )
         plan, response_text = generate_validated_plan(
@@ -683,12 +1348,30 @@ def api_plan(req: PlanRequest):
             token_to_column=token_to_column,
             max_retries=2,
         )
+    except HTTPException:
+        raise
     except Exception as err:
-        raise HTTPException(status_code=500, detail=f"Planning failed ({req.provider}): {err}")
+        err_msg = str(err)
+        # Handle Quota / ResourceExhausted errors safely
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Gemini API quota exceeded. The server or configured API key has reached its quota limit. Please provide a personal API key in Settings or wait before retrying.",
+            )
+        # Handle authentication / invalid key errors safely
+        if any(sig in err_msg for sig in ["400", "401", "403", "API_KEY_INVALID", "INVALID_ARGUMENT", "PERMISSION_DENIED"]) and ("key" in err_msg.lower() or "auth" in err_msg.lower() or "credential" in err_msg.lower()):
+            clean_detail = sanitize_secret_strings(err_msg)
+            raise HTTPException(
+                status_code=401,
+                detail=f"Authentication or key error ({req.provider}): {clean_detail}",
+            )
+        clean_detail = sanitize_secret_strings(err_msg)
+        raise HTTPException(status_code=500, detail=f"Planning failed ({req.provider}): {clean_detail}")
 
     # Apply guardrails
     plan = apply_local_guardrails(plan, df, profile)
     session["plan"] = plan
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     actions_list = []
     for idx, action in enumerate(plan.actions):
@@ -716,12 +1399,9 @@ def api_plan(req: PlanRequest):
 
 
 @app.post("/api/plan/add_action")
-def api_plan_add_action(req: AddActionRequest):
+def api_plan_add_action(req: AddActionRequest, request: Request = None):
     """Manually add a custom cleaning operation to the current session plan."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     if not session.get("plan"):
         session["plan"] = CleaningPlan(summary="User-configured plan", actions=[])
 
@@ -742,6 +1422,7 @@ def api_plan_add_action(req: AddActionRequest):
     from planner import assign_action_risk
     assign_action_risk(action_obj, session.get("profile", {}), session.get("df_original"))
     plan.actions.append(action_obj)
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     actions_list = []
     for idx, act in enumerate(plan.actions):
@@ -767,17 +1448,15 @@ def api_plan_add_action(req: AddActionRequest):
 
 
 @app.post("/api/plan/remove_action")
-def api_plan_remove_action(req: RemoveActionRequest):
+def api_plan_remove_action(req: RemoveActionRequest, request: Request = None):
     """Remove an operation from the plan by index."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     plan = session.get("plan")
     if not plan or req.action_index < 0 or req.action_index >= len(plan.actions):
         raise HTTPException(status_code=400, detail="Invalid action index.")
 
     plan.actions.pop(req.action_index)
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     actions_list = []
     for idx, act in enumerate(plan.actions):
@@ -803,12 +1482,9 @@ def api_plan_remove_action(req: RemoveActionRequest):
 
 
 @app.post("/api/clean")
-def api_clean(req: CleanRequest):
+def api_clean(req: CleanRequest, request: Request = None):
     """Execute user-approved cleaning actions and return visual diff."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     plan = session.get("plan")
     if not plan:
         from schemas import CleaningPlan
@@ -825,11 +1501,12 @@ def api_clean(req: CleanRequest):
         if idx in approved_set
     ]
 
-    df_cleaned, executed_actions = execute_cleaning_plan(
-        df=df_original.copy(deep=True),
-        actions=selected_actions,
-        session=cleaning_session,
-    )
+    with heavy_operation_slot():
+        df_cleaned, executed_actions = execute_cleaning_plan(
+            df=df_original.copy(deep=True),
+            actions=selected_actions,
+            session=cleaning_session,
+        )
 
     session["df_current"] = df_cleaned
     session["cleaning_session"] = cleaning_session
@@ -873,6 +1550,7 @@ def api_clean(req: CleanRequest):
     with open(report_json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
+    SESSIONS.sync_session_to_disk(req.session_id)
     diff_data = compute_side_by_side_diff(df_before, df_cleaned)
 
     return {
@@ -904,18 +1582,20 @@ def api_clean(req: CleanRequest):
 
 
 @app.post("/api/session/undo")
-def api_session_undo(req: Dict[str, str]):
+def api_session_undo(req: Dict[str, Any], request: Request = None):
     """Undo the last cleaning action step in the active session."""
     session_id = req.get("session_id")
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    session = get_authenticated_session(session_id, request)
 
-    sess = SESSIONS[session_id]["cleaning_session"]
+    sess = session["cleaning_session"]
     result = sess.undo()
     df_current = sess.get_current_df()
-    SESSIONS[session_id]["df_current"] = df_current
+    session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(session_id)
 
-    diff_data = compute_side_by_side_diff(SESSIONS[session_id]["df_original"], df_current)
+    diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
         "status": result["status"],
         "message": result["message"],
@@ -928,10 +1608,10 @@ def api_session_undo(req: Dict[str, str]):
             "rows_retained": diff_data["rows_after"],
             "rows_retained_pct": round((diff_data["rows_after"] / max(1, diff_data["rows_before"])) * 100, 1),
             "modified_cells_count": diff_data["modified_cells_count"],
-            "total_missing_before": int(SESSIONS[session_id]["df_original"].isna().sum().sum()),
+            "total_missing_before": int(session["df_original"].isna().sum().sum()),
             "total_missing_after": int(df_current.isna().sum().sum()),
-            "missing_resolved": max(0, int(SESSIONS[session_id]["df_original"].isna().sum().sum()) - int(df_current.isna().sum().sum())),
-            "duplicates_removed": max(0, int(SESSIONS[session_id]["df_original"].duplicated().sum() - df_current.duplicated().sum())),
+            "missing_resolved": max(0, int(session["df_original"].isna().sum().sum()) - int(df_current.isna().sum().sum())),
+            "duplicates_removed": max(0, int(session["df_original"].duplicated().sum() - df_current.duplicated().sum())),
             "columns_removed": [c for c in diff_data["columns_before"] if c not in diff_data["columns_after"]],
             "columns_removed_count": max(0, len(diff_data["columns_before"]) - len(diff_data["columns_after"])),
         },
@@ -941,18 +1621,20 @@ def api_session_undo(req: Dict[str, str]):
 
 
 @app.post("/api/session/redo")
-def api_session_redo(req: Dict[str, str]):
+def api_session_redo(req: Dict[str, Any], request: Request = None):
     """Redo an undone step."""
     session_id = req.get("session_id")
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    session = get_authenticated_session(session_id, request)
 
-    sess = SESSIONS[session_id]["cleaning_session"]
+    sess = session["cleaning_session"]
     result = sess.redo()
     df_current = sess.get_current_df()
-    SESSIONS[session_id]["df_current"] = df_current
+    session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(session_id)
 
-    diff_data = compute_side_by_side_diff(SESSIONS[session_id]["df_original"], df_current)
+    diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
         "status": result["status"],
         "message": result["message"],
@@ -965,10 +1647,10 @@ def api_session_redo(req: Dict[str, str]):
             "rows_retained": diff_data["rows_after"],
             "rows_retained_pct": round((diff_data["rows_after"] / max(1, diff_data["rows_before"])) * 100, 1),
             "modified_cells_count": diff_data["modified_cells_count"],
-            "total_missing_before": int(SESSIONS[session_id]["df_original"].isna().sum().sum()),
+            "total_missing_before": int(session["df_original"].isna().sum().sum()),
             "total_missing_after": int(df_current.isna().sum().sum()),
-            "missing_resolved": max(0, int(SESSIONS[session_id]["df_original"].isna().sum().sum()) - int(df_current.isna().sum().sum())),
-            "duplicates_removed": max(0, int(SESSIONS[session_id]["df_original"].duplicated().sum() - df_current.duplicated().sum())),
+            "missing_resolved": max(0, int(session["df_original"].isna().sum().sum()) - int(df_current.isna().sum().sum())),
+            "duplicates_removed": max(0, int(session["df_original"].duplicated().sum() - df_current.duplicated().sum())),
             "columns_removed": [c for c in diff_data["columns_before"] if c not in diff_data["columns_after"]],
             "columns_removed_count": max(0, len(diff_data["columns_before"]) - len(diff_data["columns_after"])),
         },
@@ -979,18 +1661,20 @@ def api_session_redo(req: Dict[str, str]):
 
 @app.post("/api/session/rollback")
 @app.post("/api/session/rollback_all")
-def api_session_rollback(req: Dict[str, str]):
+def api_session_rollback(req: Dict[str, Any], request: Request = None):
     """Rollback all changes to Step 0 (original data state)."""
     session_id = req.get("session_id")
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    session = get_authenticated_session(session_id, request)
 
-    sess = SESSIONS[session_id]["cleaning_session"]
+    sess = session["cleaning_session"]
     result = sess.rollback_all()
     df_current = sess.get_current_df()
-    SESSIONS[session_id]["df_current"] = df_current
+    session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(session_id)
 
-    diff_data = compute_side_by_side_diff(SESSIONS[session_id]["df_original"], df_current)
+    diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
         "status": result["status"],
         "message": result["message"],
@@ -1003,7 +1687,7 @@ def api_session_rollback(req: Dict[str, str]):
             "rows_retained": diff_data["rows_after"],
             "rows_retained_pct": 100.0,
             "modified_cells_count": 0,
-            "total_missing_before": int(SESSIONS[session_id]["df_original"].isna().sum().sum()),
+            "total_missing_before": int(session["df_original"].isna().sum().sum()),
             "total_missing_after": int(df_current.isna().sum().sum()),
             "missing_resolved": 0,
             "duplicates_removed": 0,
@@ -1016,12 +1700,9 @@ def api_session_rollback(req: Dict[str, str]):
 
 
 @app.post("/api/evaluate")
-def api_evaluate(req: EvaluateRequest):
+def api_evaluate(req: EvaluateRequest, request: Request = None):
     """Run quality evaluation against a ground truth benchmark CSV."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     gt_path = req.ground_truth_path or "data/benchmark/ground_truth.csv"
     if not os.path.exists(gt_path):
         raise HTTPException(status_code=404, detail=f"Ground truth CSV not found: {gt_path}")
@@ -1030,7 +1711,8 @@ def api_evaluate(req: EvaluateRequest):
     df_cleaned = session["df_current"]
     try:
         df_truth = pd.read_csv(gt_path)
-        eval_results = evaluate_cleaning(df_dirty=df_dirty, df_cleaned=df_cleaned, df_ground_truth=df_truth)
+        with heavy_operation_slot():
+            eval_results = evaluate_cleaning(df_dirty=df_dirty, df_cleaned=df_cleaned, df_ground_truth=df_truth)
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"Evaluation failed: {err}")
 
@@ -1039,37 +1721,43 @@ def api_evaluate(req: EvaluateRequest):
 
 
 @app.get("/api/download/cleaned")
-def download_cleaned(session_id: str = Query(...)):
-    """Download cleaned CSV dataset."""
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[session_id]
+def download_cleaned(session_id: str = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    """Download cleaned CSV dataset with authenticated headers and no-store caching."""
+    session = get_authenticated_session(session_id, request, token=token)
     df = session["df_current"]
 
     temp_path = os.path.join(session["run_dir"], "cleaned_download.csv")
     df.to_csv(temp_path, index=False)
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+    }
     return FileResponse(
         temp_path,
         media_type="text/csv",
         filename=f"cleaned_{os.path.basename(session['filepath'])}",
+        headers=headers,
     )
 
 
 @app.get("/api/download/report")
-def download_report(session_id: str = Query(...)):
-    """Download audit report JSON."""
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[session_id]
+def download_report(session_id: str = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    """Download audit report JSON with authenticated headers and no-store caching."""
+    session = get_authenticated_session(session_id, request, token=token)
     report = session.get("report")
     if not report:
         raise HTTPException(status_code=400, detail="No cleaning report generated yet.")
 
     report_path = os.path.join(session["run_dir"], "cleaning_report.json")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+    }
     return FileResponse(
         report_path,
         media_type="application/json",
         filename=f"report_{session['run_id']}.json",
+        headers=headers,
     )
 
 
@@ -1078,38 +1766,39 @@ def download_report(session_id: str = Query(...)):
 # ============================================================
 
 @app.post("/api/cluster/detect")
-def api_cluster_detect(req: ClusterDetectRequest):
+def api_cluster_detect(req: ClusterDetectRequest, request: Request = None):
     """Detect similar string clusters in a column using DataRefine clustering algorithms."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     df = session["df_current"]
     if req.column not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.column}' not in dataset.")
 
     try:
-        clusters = detect_clusters(
-            series=df[req.column],
-            method=req.method,
-            params=req.params,
-        )
+        with heavy_operation_slot():
+            clusters = detect_clusters(
+                series=df[req.column],
+                method=req.method,
+                params=req.params,
+            )
+        warning = getattr(clusters, "warning", None)
+        truncated = getattr(clusters, "truncated", False)
         return {
             "status": "success",
             "column": req.column,
             "method": req.method,
             "cluster_count": len(clusters),
-            "clusters": clusters,
+            "clusters": list(clusters),
+            "warning": warning,
+            "truncated": truncated,
         }
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"Clustering failed: {err}")
 
 
 @app.post("/api/cluster/apply")
-def api_cluster_apply(req: ClusterApplyRequest):
+def api_cluster_apply(req: ClusterApplyRequest, request: Request = None):
     """Apply approved cluster merges to harmonize text variants to canonical forms."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     sess: CleaningSession = session["cleaning_session"]
 
     action = CleaningAction(
@@ -1118,9 +1807,11 @@ def api_cluster_apply(req: ClusterApplyRequest):
         params={"clusters": req.clusters, "mapping": req.mapping},
         reasoning=f"Harmonize text variants in '{req.column}' using DataRefine clustering",
     )
-    res = sess.apply_action(action)
+    with heavy_operation_slot():
+        res = sess.apply_action(action)
     df_current = sess.get_current_df()
     session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
@@ -1140,11 +1831,9 @@ def api_cluster_apply(req: ClusterApplyRequest):
 
 
 @app.post("/api/grel/preview")
-def api_grel_preview(req: GRELPreviewRequest):
+def api_grel_preview(req: GRELPreviewRequest, request: Request = None):
     """Preview a safe, restricted GREL-inspired expression on sample rows."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     df = session["df_current"]
     if req.column not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.column}' not in dataset.")
@@ -1159,11 +1848,9 @@ def api_grel_preview(req: GRELPreviewRequest):
 
 
 @app.post("/api/grel/apply")
-def api_grel_apply(req: GRELApplyRequest):
+def api_grel_apply(req: GRELApplyRequest, request: Request = None):
     """Apply a safe GREL transformation to a column and record a checkpoint."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     sess: CleaningSession = session["cleaning_session"]
 
     action = CleaningAction(
@@ -1172,9 +1859,11 @@ def api_grel_apply(req: GRELApplyRequest):
         params={"expression": req.expression, "on_error": req.on_error},
         reasoning=f"GREL Transformation on '{req.column}': {req.expression}",
     )
-    res = sess.apply_action(action)
+    with heavy_operation_slot():
+        res = sess.apply_action(action)
     df_current = sess.get_current_df()
     session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
@@ -1194,11 +1883,9 @@ def api_grel_apply(req: GRELApplyRequest):
 
 
 @app.post("/api/facets/compute")
-def api_facets_compute(req: FacetComputeRequest):
+def api_facets_compute(req: FacetComputeRequest, request: Request = None):
     """Compute text, numeric, or date facets with value counts and distribution."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     df = session["df_current"]
     if req.column not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.column}' not in dataset.")
@@ -1221,11 +1908,9 @@ def api_facets_compute(req: FacetComputeRequest):
 
 
 @app.post("/api/dataset/explore")
-def api_dataset_explore(req: ExploreRequest):
+def api_dataset_explore(req: ExploreRequest, request: Request = None):
     """Explore dataset with multi-column facet filtering, global search, sorting, and pagination."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     df = session["df_current"]
 
     exp_res = explore_dataset(
@@ -1241,11 +1926,9 @@ def api_dataset_explore(req: ExploreRequest):
 
 
 @app.post("/api/reconcile/match")
-def api_reconcile_match(req: ReconcileRequest):
+def api_reconcile_match(req: ReconcileRequest, request: Request = None):
     """Match messy column values against reference entity catalogs and compute similarity scores."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     df = session["df_current"]
     if req.column not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.column}' not in dataset.")
@@ -1268,11 +1951,9 @@ def api_reconcile_match(req: ReconcileRequest):
 
 
 @app.post("/api/reconcile/apply")
-def api_reconcile_apply(req: ReconcileApplyRequest):
+def api_reconcile_apply(req: ReconcileApplyRequest, request: Request = None):
     """Apply approved entity mappings to standardize column values."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     sess: CleaningSession = session["cleaning_session"]
 
     action = CleaningAction(
@@ -1281,9 +1962,11 @@ def api_reconcile_apply(req: ReconcileApplyRequest):
         params={"mapping": req.mapping, "catalog": req.catalog},
         reasoning=f"Entity reconciliation against catalog '{req.catalog}' for '{req.column}'",
     )
-    res = sess.apply_action(action)
+    with heavy_operation_slot():
+        res = sess.apply_action(action)
     df_current = sess.get_current_df()
     session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(req.session_id)
 
     diff_data = compute_side_by_side_diff(session["df_original"], df_current)
     return {
@@ -1303,11 +1986,9 @@ def api_reconcile_apply(req: ReconcileApplyRequest):
 
 
 @app.get("/api/workflow/history")
-def api_workflow_history(session_id: str = Query(...)):
+def api_workflow_history(session_id: str = Query(...), token: Optional[str] = Query(None), request: Request = None):
     """Retrieve executed operations serialized in DataRefine Workflow JSON recipe format."""
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[session_id]
+    session = get_authenticated_session(session_id, request, token=token)
     sess: CleaningSession = session["cleaning_session"]
     recipe = WorkflowRecipeManager.export_recipe_from_history(sess.get_history())
     return {
@@ -1318,12 +1999,12 @@ def api_workflow_history(session_id: str = Query(...)):
 
 
 @app.post("/api/workflow/export_recipe")
-def api_workflow_export_recipe(req: Dict[str, str]):
+def api_workflow_export_recipe(req: Dict[str, str], request: Request = None):
     """Export the current session's operation history as a downloadable JSON recipe."""
     session_id = req.get("session_id")
-    if not session_id or session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[session_id]
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    session = get_authenticated_session(session_id, request)
     sess: CleaningSession = session["cleaning_session"]
     recipe = WorkflowRecipeManager.export_recipe_from_history(sess.get_history())
     return JSONResponse(
@@ -1333,11 +2014,9 @@ def api_workflow_export_recipe(req: Dict[str, str]):
 
 
 @app.post("/api/workflow/apply_recipe")
-def api_workflow_apply_recipe(req: RecipeApplyRequest):
+def api_workflow_apply_recipe(req: RecipeApplyRequest, request: Request = None):
     """Import and sequentially replay a DataRefine Workflow JSON recipe onto the active dataset."""
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    session = SESSIONS[req.session_id]
+    session = get_authenticated_session(req.session_id, request)
     sess: CleaningSession = session["cleaning_session"]
 
     valid, errors = WorkflowRecipeManager.validate_recipe(req.recipe)
@@ -1365,6 +2044,7 @@ def api_workflow_apply_recipe(req: RecipeApplyRequest):
 
     df_current = sess.get_current_df()
     session["df_current"] = df_current
+    SESSIONS.sync_session_to_disk(req.session_id)
     diff_data = compute_side_by_side_diff(session["df_original"], df_current)
 
     return {
@@ -2314,16 +2994,26 @@ def main():
     import argparse
     import uvicorn
 
+    default_host = os.getenv("HOST", "127.0.0.1")
+    default_port = int(os.getenv("PORT", "8000"))
+
     parser = argparse.ArgumentParser(description="AI Data Cleaner Web Dashboard & API Server")
-    parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+    parser.add_argument("--host", default=default_host, help=f"Server host (default: {default_host})")
+    parser.add_argument("--port", type=int, default=default_port, help=f"Server port (default: {default_port})")
     args = parser.parse_args()
 
     print(f"\n=======================================================")
     print(f"  DataRefine — Data Quality & Cleaning Studio")
     print(f"  Running at: http://{args.host}:{args.port}")
     print(f"=======================================================\n")
-    uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
+    uvicorn.run(
+        "server:app",
+        host=args.host,
+        port=args.port,
+        reload=False,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":
