@@ -1582,6 +1582,7 @@ def api_clean(req: CleanRequest, request: Request = None):
 
 
 @app.post("/api/session/undo")
+@app.post("/api/undo")
 def api_session_undo(req: Dict[str, Any], request: Request = None):
     """Undo the last cleaning action step in the active session."""
     session_id = req.get("session_id")
@@ -1621,6 +1622,7 @@ def api_session_undo(req: Dict[str, Any], request: Request = None):
 
 
 @app.post("/api/session/redo")
+@app.post("/api/redo")
 def api_session_redo(req: Dict[str, Any], request: Request = None):
     """Redo an undone step."""
     session_id = req.get("session_id")
@@ -1661,6 +1663,7 @@ def api_session_redo(req: Dict[str, Any], request: Request = None):
 
 @app.post("/api/session/rollback")
 @app.post("/api/session/rollback_all")
+@app.post("/api/rollback")
 def api_session_rollback(req: Dict[str, Any], request: Request = None):
     """Rollback all changes to Step 0 (original data state)."""
     session_id = req.get("session_id")
