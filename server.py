@@ -1575,6 +1575,9 @@ def api_clean(req: CleanRequest, request: Request = None):
         },
         "diff_table": diff_data["row_diffs"],
         "columns": diff_data["columns_after"],
+        "current_step": cleaning_session.current_step,
+        "can_undo": cleaning_session.can_undo(),
+        "can_redo": cleaning_session.can_redo(),
         "checkpoints": cleaning_session.get_history(),
         "unresolved_issues": report.get("unresolved_issues", []),
         "validation": validation,
@@ -1601,6 +1604,8 @@ def api_session_undo(req: Dict[str, Any], request: Request = None):
         "status": result["status"],
         "message": result["message"],
         "current_step": sess.current_step,
+        "can_undo": sess.can_undo(),
+        "can_redo": sess.can_redo(),
         "checkpoints": sess.get_history(),
         "diff_summary": {
             "rows_before": diff_data["rows_before"],
@@ -1641,6 +1646,8 @@ def api_session_redo(req: Dict[str, Any], request: Request = None):
         "status": result["status"],
         "message": result["message"],
         "current_step": sess.current_step,
+        "can_undo": sess.can_undo(),
+        "can_redo": sess.can_redo(),
         "checkpoints": sess.get_history(),
         "diff_summary": {
             "rows_before": diff_data["rows_before"],
@@ -1682,6 +1689,8 @@ def api_session_rollback(req: Dict[str, Any], request: Request = None):
         "status": result["status"],
         "message": result["message"],
         "current_step": 0,
+        "can_undo": sess.can_undo(),
+        "can_redo": sess.can_redo(),
         "checkpoints": sess.get_history(),
         "diff_summary": {
             "rows_before": diff_data["rows_before"],
