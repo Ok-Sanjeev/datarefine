@@ -62,7 +62,7 @@ Two architectural options exist:
 #### Option A: Cloudflare Pages Proxy Rewrites (`_redirects`) — **Recommended**
 Cloudflare Pages supports reverse-proxy rewrites via a plain text `_redirects` file in the build output directory (`static/_redirects`):
 ```
-/api/*  https://datarefine-backend.onrender.com/api/:splat  200
+/api/*  https://ai-data-cleaner.onrender.com/api/:splat  200
 /app/*  /app.html  200
 /ui     /app.html  200
 /*      /index.html 200
@@ -74,7 +74,7 @@ Cloudflare Pages supports reverse-proxy rewrites via a plain text `_redirects` f
   4. **Backend URL Concealment:** The backend service URL is not exposed directly in user-facing network calls.
 
 #### Option B: Direct Cross-Origin API Calls
-Alternatively, the frontend could call the backend directly (`https://datarefine-backend.onrender.com/api/...`):
+Alternatively, the frontend could call the backend directly (`https://ai-data-cleaner.onrender.com/api/...`):
 - Requires introducing a configurable `API_BASE` variable in `static/app.html`.
 - Requires setting `ALLOWED_ORIGINS=https://datarefine.pages.dev` in Render environment.
 - Requires changing cookie settings in `server.py` to `SameSite=None; Secure=True` because cross-origin `SameSite=Lax` cookies are blocked by modern browsers.

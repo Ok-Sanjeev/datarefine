@@ -58,9 +58,9 @@ The file `static/_redirects` was created to govern Cloudflare Pages edge routing
 ```
 # Cloudflare Pages Routing and Reverse Proxy Configuration
 # 1. API Reverse Proxy to Render Free backend
-# Default backend URL is https://datarefine-backend.onrender.com
+# Default backend URL is https://ai-data-cleaner.onrender.com
 # Update this origin if your Render service has a custom name or domain.
-/api/*  https://datarefine-backend.onrender.com/api/:splat  200
+/api/*  https://ai-data-cleaner.onrender.com/api/:splat  200
 
 # 2. Application Workspace SPA Rewrites
 /app        /app.html  200

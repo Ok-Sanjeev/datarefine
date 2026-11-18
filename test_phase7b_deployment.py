@@ -85,6 +85,8 @@ def test_cloudflare_pages_redirects_rules():
     # 1. API reverse proxy
     assert re.search(r"^/api/\*\s+https?://[^\s]+/api/:splat\s+200", content, re.MULTILINE), \
         "Missing API proxy rewrite /api/* -> https://.../api/:splat 200"
+    assert "/api/*  https://ai-data-cleaner.onrender.com/api/:splat  200" in content, \
+        "API proxy destination must align with render.yaml service name 'ai-data-cleaner'"
 
     # 2. /app and /ui rewrites
     assert re.search(r"^/app\s+/app\.html\s+200", content, re.MULTILINE)
