@@ -13,7 +13,7 @@ import secrets
 import shutil
 import uuid
 import hmac
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import threading
 from contextlib import contextmanager
@@ -70,7 +70,7 @@ from facets import (
     apply_filters,
 )
 from reconciliation import reconcile_column_candidates, REFERENCE_CATALOGS
-from workflow_recipe import WorkflowRecipeManager
+from workflow_recipe import WorkflowRecipeManager, _resolve_column_reference
 
 
 app = FastAPI(
@@ -410,7 +410,13 @@ def sanitize_value_for_json(val: Any) -> Any:
     if isinstance(val, (np.bool_, bool)):
         return bool(val)
     if isinstance(val, (pd.Timestamp, datetime)):
-        return val.isoformat()
+        # Preserve actual timestamps when source contains meaningful time information;
+        # Date-only values serialize to clean YYYY-MM-DD instead of YYYY-MM-DDT00:00:00
+        if getattr(val, "hour", 0) != 0 or getattr(val, "minute", 0) != 0 or getattr(val, "second", 0) != 0 or getattr(val, "microsecond", 0) != 0:
+            return val.isoformat()
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, date):
+        return val.strftime("%Y-%m-%d")
     return str(val) if not isinstance(val, (str, list, dict)) else val
 
 
@@ -539,6 +545,10 @@ def compute_side_by_side_diff(
                     try:
                         if isinstance(v_orig, (float, np.floating)) and isinstance(v_clean, (float, np.floating)):
                             changed = not np.isclose(v_orig, v_clean)
+                        elif isinstance(v_clean, (datetime, pd.Timestamp, date)) or isinstance(v_orig, (datetime, pd.Timestamp, date)):
+                            orig_fmt = sanitize_value_for_json(v_orig)
+                            clean_fmt = sanitize_value_for_json(v_clean)
+                            changed = orig_fmt != clean_fmt
                         else:
                             changed = str(v_orig).strip() != str(v_clean).strip()
                     except Exception:
@@ -1650,9 +1660,58 @@ def api_clean(req: CleanRequest, request: Request = None):
     SESSIONS.sync_session_to_disk(req.session_id)
     diff_data = compute_side_by_side_diff(df_before, df_cleaned)
 
+    # Derive accurate execution analytics
+    actions_proposed = len(plan.actions) if hasattr(plan, "actions") else 0
+    actions_approved = len(req.approved_action_ids)
+    actions_attempted = len(selected_actions)
+    actions_applied = sum(1 for a in executed_actions if a.get("status") == "success")
+    actions_failed = sum(1 for a in executed_actions if a.get("status") == "failed")
+    actions_skipped = max(0, actions_proposed - actions_approved)
+    cells_modified = diff_data["modified_cells_count"]
+    rows_delta = diff_data["rows_delta"]
+    cols_removed_count = max(0, len(diff_data["columns_before"]) - len(diff_data["columns_after"]))
+
+    if actions_attempted == 0:
+        execution_status = "no_operations_selected"
+        status_label = "No Operations Selected"
+        status_desc = "No cleaning operations were selected. Dataset remains in original state."
+    elif actions_failed > 0 and actions_applied == 0:
+        execution_status = "failed"
+        status_label = "Execution Failed"
+        status_desc = f"{actions_failed} operation(s) failed during execution."
+    elif actions_failed > 0 and actions_applied > 0:
+        execution_status = "partially_completed"
+        status_label = "Partially Completed"
+        status_desc = f"{actions_applied} operation(s) applied, {actions_failed} failed."
+    elif actions_applied > 0 and cells_modified == 0 and rows_delta == 0 and cols_removed_count == 0:
+        execution_status = "completed_no_changes"
+        status_label = "Completed (No Changes Needed)"
+        status_desc = f"{actions_applied} operation(s) evaluated; data already conforms to criteria with 0 cell modifications."
+    else:
+        execution_status = "verified_completed"
+        status_label = "Verified Completed"
+        status_desc = f"{actions_applied} vectorized transformation(s) applied with step-by-step checkpoint isolation."
+
     return {
         "session_id": req.session_id,
         "run_id": session["run_id"],
+        "execution_status": execution_status,
+        "execution_status_label": status_label,
+        "execution_status_desc": status_desc,
+        "actions_applied": actions_applied,
+        "actions_attempted": actions_attempted,
+        "actions_failed": actions_failed,
+        "actions_skipped": actions_skipped,
+        "cells_modified": cells_modified,
+        "operations_summary": {
+            "proposed": actions_proposed,
+            "approved": actions_approved,
+            "attempted": actions_attempted,
+            "applied": actions_applied,
+            "failed": actions_failed,
+            "skipped": actions_skipped,
+            "cells_modified": cells_modified,
+        },
         "diff_summary": {
             "rows_before": diff_data["rows_before"],
             "rows_after": diff_data["rows_after"],
@@ -1665,10 +1724,13 @@ def api_clean(req: CleanRequest, request: Request = None):
             "missing_resolved": max(0, sum(original_missing.values()) - sum(cleaned_missing.values())),
             "duplicates_removed": max(0, int(df_before.duplicated().sum() - df_cleaned.duplicated().sum())),
             "columns_removed": [c for c in diff_data["columns_before"] if c not in diff_data["columns_after"]],
-            "columns_removed_count": max(0, len(diff_data["columns_before"]) - len(diff_data["columns_after"])),
-            "actions_executed": len(executed_actions),
-            "actions_proposed": len(plan.actions) if hasattr(plan, "actions") else 0,
-            "actions_approved": len(req.approved_action_ids),
+            "columns_removed_count": cols_removed_count,
+            "actions_executed": actions_applied,
+            "actions_applied": actions_applied,
+            "actions_failed": actions_failed,
+            "actions_skipped": actions_skipped,
+            "actions_proposed": actions_proposed,
+            "actions_approved": actions_approved,
         },
         "diff_table": diff_data["row_diffs"],
         "columns": diff_data["columns_after"],
@@ -1769,14 +1831,18 @@ def api_session_redo(req: Dict[str, Any], request: Request = None):
 @app.post("/api/session/rollback_all")
 @app.post("/api/rollback")
 def api_session_rollback(req: Dict[str, Any], request: Request = None):
-    """Rollback all changes to Step 0 (original data state)."""
+    """Rollback all changes to Step 0 (original data state) or target checkpoint step."""
     session_id = req.get("session_id")
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required.")
     session = get_authenticated_session(session_id, request)
 
     sess = session["cleaning_session"]
-    result = sess.rollback_all()
+    target_step = req.get("target_step")
+    if target_step is not None:
+        result = sess.rollback_to(int(target_step))
+    else:
+        result = sess.rollback_all()
     df_current = sess.get_current_df()
     session["df_current"] = df_current
     SESSIONS.sync_session_to_disk(session_id)
@@ -1785,23 +1851,23 @@ def api_session_rollback(req: Dict[str, Any], request: Request = None):
     return {
         "status": result["status"],
         "message": result["message"],
-        "current_step": 0,
+        "current_step": sess.current_step,
         "can_undo": sess.can_undo(),
         "can_redo": sess.can_redo(),
         "checkpoints": sess.get_history(),
         "diff_summary": {
             "rows_before": diff_data["rows_before"],
             "rows_after": diff_data["rows_after"],
-            "rows_delta": 0,
+            "rows_delta": diff_data["rows_delta"],
             "rows_retained": diff_data["rows_after"],
-            "rows_retained_pct": 100.0,
-            "modified_cells_count": 0,
+            "rows_retained_pct": round((diff_data["rows_after"] / max(1, diff_data["rows_before"])) * 100, 1),
+            "modified_cells_count": diff_data["modified_cells_count"],
             "total_missing_before": int(session["df_original"].isna().sum().sum()),
             "total_missing_after": int(df_current.isna().sum().sum()),
-            "missing_resolved": 0,
-            "duplicates_removed": 0,
-            "columns_removed": [],
-            "columns_removed_count": 0,
+            "missing_resolved": max(0, int(session["df_original"].isna().sum().sum()) - int(df_current.isna().sum().sum())),
+            "duplicates_removed": max(0, int(session["df_original"].duplicated().sum() - df_current.duplicated().sum())),
+            "columns_removed": [c for c in diff_data["columns_before"] if c not in diff_data["columns_after"]],
+            "columns_removed_count": max(0, len(diff_data["columns_before"]) - len(diff_data["columns_after"])),
         },
         "diff_table": diff_data["row_diffs"],
         "columns": diff_data["columns_after"],
@@ -2135,19 +2201,51 @@ def api_workflow_apply_recipe(req: RecipeApplyRequest, request: Request = None):
     operations = req.recipe.get("operations", [])
     applied_count = 0
     errors_encountered = []
+    column_aliases: Dict[str, str] = {str(c): str(c) for c in sess.current_df.columns}
 
     for idx, op in enumerate(operations):
+        action_name = op["action"]
+        raw_column = op.get("column")
+        params = dict(op.get("params", {}))
+        before_cols = list(sess.current_df.columns)
+        resolved_column = _resolve_column_reference(raw_column, before_cols, column_aliases)
+
         try:
+            if action_name == "rename_column" and "old_name" in params:
+                params["old_name"] = _resolve_column_reference(params["old_name"], before_cols, column_aliases)
+
             action_obj = CleaningAction(
-                action=op["action"],
-                column=op.get("column"),
-                params=op.get("params", {}),
+                action=action_name,
+                column=resolved_column,
+                params=params,
                 reasoning=op.get("reasoning", f"Replayed recipe step {idx + 1}"),
             )
             sess.apply_action(action_obj)
             applied_count += 1
+
+            after_cols = list(sess.current_df.columns)
+            if after_cols != before_cols:
+                if action_name == "normalize_column_names" and len(before_cols) == len(after_cols):
+                    for old_c, new_c in zip(before_cols, after_cols):
+                        for k, v in list(column_aliases.items()):
+                            if v == old_c:
+                                column_aliases[k] = new_c
+                        column_aliases[old_c] = new_c
+                        column_aliases[new_c] = new_c
+                elif action_name == "rename_column":
+                    old_name = params.get("old_name", raw_column)
+                    new_name = params.get("new_name")
+                    if old_name and new_name:
+                        for k, v in list(column_aliases.items()):
+                            if v == old_name:
+                                column_aliases[k] = new_name
+                        column_aliases[old_name] = new_name
+                        column_aliases[new_name] = new_name
+                for c in after_cols:
+                    if c not in column_aliases:
+                        column_aliases[c] = c
         except Exception as e:
-            errors_encountered.append(f"Step {idx + 1} ({op.get('action')}): {str(e)}")
+            errors_encountered.append(f"Step {idx + 1} ({action_name}): {str(e)}")
             if req.stop_on_error:
                 break
 
@@ -2171,6 +2269,24 @@ def api_workflow_apply_recipe(req: RecipeApplyRequest, request: Request = None):
         },
         "diff_table": diff_data["row_diffs"],
         "columns": diff_data["columns_after"],
+    }
+
+
+@app.get("/api/export/python")
+def api_export_python(session_id: str = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    """Generate standalone reproducible Python script from session cleaning history."""
+    session = get_authenticated_session(session_id, request, token=token)
+    sess: CleaningSession = session["cleaning_session"]
+    input_file = os.path.basename(session.get("filepath", "dataset.csv"))
+    script = WorkflowRecipeManager.generate_python_script_from_history(
+        history=sess.get_history(),
+        input_filename=input_file,
+        output_filename=f"cleaned_{input_file}",
+    )
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "script": script,
     }
 
 

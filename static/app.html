@@ -1023,9 +1023,9 @@
           <div>
             <div class="flex items-center space-x-2">
               <h2 class="text-base font-semibold text-white">Cleaning Execution Analytics</h2>
-              <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-950/40 text-emerald-400 border border-emerald-800/40">Verified Completed</span>
+              <span id="diff-status-badge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-950/40 text-emerald-400 border border-emerald-800/40">Verified Completed</span>
             </div>
-            <p class="text-xs text-zinc-400 mt-0.5">Vectorized transformations applied with step-by-step checkpoint isolation.</p>
+            <p id="diff-status-desc" class="text-xs text-zinc-400 mt-0.5">Vectorized transformations applied with step-by-step checkpoint isolation.</p>
           </div>
 
           <!-- Quality Convergence Score -->
@@ -3228,6 +3228,29 @@
       const actEl = document.getElementById('diff-actions-executed');
       if (actEl) actEl.textContent = `${actionsExec} applied`;
 
+      // Execution Status Badge & Description
+      const statusBadge = document.getElementById('diff-status-badge');
+      const statusDesc = document.getElementById('diff-status-desc');
+      const execStatus = data.execution_status || 'verified_completed';
+      if (statusBadge) {
+        statusBadge.textContent = data.execution_status_label || (
+          execStatus === 'no_operations_selected' ? 'No Operations Selected' :
+          execStatus === 'completed_no_changes' ? 'No Changes Detected' :
+          execStatus === 'partially_completed' ? 'Partially Completed' :
+          execStatus === 'failed' ? 'Execution Failed' : 'Verified Completed'
+        );
+        statusBadge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-full ' + (
+          execStatus === 'no_operations_selected' ? 'bg-zinc-800/60 text-zinc-400 border border-zinc-700' :
+          execStatus === 'completed_no_changes' ? 'bg-amber-950/40 text-amber-400 border border-amber-800/40' :
+          execStatus === 'partially_completed' ? 'bg-amber-950/40 text-amber-400 border border-amber-800/40' :
+          execStatus === 'failed' ? 'bg-rose-950/40 text-rose-400 border border-rose-800/40' :
+          'bg-emerald-950/40 text-emerald-400 border border-emerald-800/40'
+        );
+      }
+      if (statusDesc && data.execution_status_desc) {
+        statusDesc.textContent = data.execution_status_desc;
+      }
+
       // Calculate Before & After Quality Scores
       const colCount = data.columns ? data.columns.length : 1;
       const totalCellsBefore = (rowsBefore || 1) * colCount;
@@ -3239,10 +3262,16 @@
       const missingRateAfter = missAfter / totalCellsAfter;
       const scoreAfter = Math.max(10, Math.min(100, Math.round(100 - (missingRateAfter * 60))));
 
-      document.getElementById('diff-quality-before').textContent = `${scoreBefore}%`;
-      document.getElementById('diff-quality-after').textContent = `${scoreAfter}%`;
-      const gain = Math.max(0, scoreAfter - scoreBefore);
-      document.getElementById('diff-quality-gain').textContent = `+${gain}% Quality Convergence`;
+      if (execStatus === 'no_operations_selected') {
+        document.getElementById('diff-quality-before').textContent = `${scoreBefore}%`;
+        document.getElementById('diff-quality-after').textContent = `${scoreBefore}%`;
+        document.getElementById('diff-quality-gain').textContent = `+0% Quality Convergence (No Changes)`;
+      } else {
+        document.getElementById('diff-quality-before').textContent = `${scoreBefore}%`;
+        document.getElementById('diff-quality-after').textContent = `${scoreAfter}%`;
+        const gain = Math.max(0, scoreAfter - scoreBefore);
+        document.getElementById('diff-quality-gain').textContent = `+${gain}% Quality Convergence`;
+      }
 
       // Checkpoint timeline with guaranteed valid labels
       const timeline = document.getElementById('checkpoints-timeline');
@@ -3978,11 +4007,19 @@
           `;
         }).join(' ');
 
+        const conf = typeof cl.confidence === 'number' ? cl.confidence : 1.0;
+        const isHighConf = conf >= 0.8;
+        const confPct = Math.round(conf * 100);
+        const confBadge = isHighConf
+          ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950/40 text-emerald-400 border border-emerald-800/40">${confPct}% match</span>`
+          : `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950/40 text-amber-400 border border-amber-800/40">${confPct}% match (Review)</span>`;
+
         card.innerHTML = `
           <div class="flex items-center justify-between">
             <div class="flex items-center space-x-2">
-              <input type="checkbox" id="cluster-chk-${idx}" checked class="cluster-chk w-4 h-4 rounded text-blue-600 bg-surface-card border-zinc-700">
+              <input type="checkbox" id="cluster-chk-${idx}" ${isHighConf ? 'checked' : ''} class="cluster-chk w-4 h-4 rounded text-blue-600 bg-surface-card border-zinc-700">
               <span class="font-semibold text-white">Cluster #${idx + 1}</span>
+              ${confBadge}
               <span class="text-[10px] text-zinc-500 font-mono">(${clusterSize} variants · ${cl.total_rows || 0} rows)</span>
             </div>
             <div class="flex items-center space-x-1.5">
@@ -4003,14 +4040,17 @@
     }
 
     function selectHighConfidenceClusters() {
+      let count = 0;
       detectedClustersList.forEach((cl, idx) => {
         const chk = document.getElementById(`cluster-chk-${idx}`);
         if (chk) {
-          const membersList = cl.values || cl.members || [];
-          chk.checked = Boolean(cl.proposed_canonical && membersList.length >= 2);
+          const conf = typeof cl.confidence === 'number' ? cl.confidence : 1.0;
+          const isHighConf = conf >= 0.8;
+          chk.checked = isHighConf;
+          if (isHighConf) count++;
         }
       });
-      showToast('Selected high-confidence candidate clusters.');
+      showToast(`Selected ${count} high-confidence candidate clusters (≥80% similarity).`);
     }
 
     async function applySelectedClusters() {

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -817,28 +818,51 @@ def apply_local_guardrails(plan: CleaningPlan, df: pd.DataFrame, profile: dict) 
 # EXECUTE AI-GENERATED ACTIONS
 # ============================================================
 
-def execute_cleaning_plan(df: pd.DataFrame, actions: list, session: Optional[CleaningSession] = None) -> tuple[pd.DataFrame, list[dict]]:
+def _normalize_col_key(col_name: Any) -> str:
+    """Normalize a column name for resilient matching (lowercase snake_case)."""
+    return re.sub(r"[^\w]+", "_", str(col_name).strip().lower()).strip("_")
+
+
+def _resolve_column_reference(col: Optional[str], current_columns: List[str], aliases: Dict[str, str]) -> Optional[str]:
+    """Resolve column reference across sequential renaming or normalization operations."""
+    if col is None:
+        return None
+    if col in current_columns:
+        return col
+    if col in aliases and aliases[col] in current_columns:
+        return aliases[col]
+    target_norm = _normalize_col_key(col)
+    for c in current_columns:
+        if _normalize_col_key(c) == target_norm:
+            aliases[col] = c
+            return c
+    if col in aliases:
+        return aliases[col]
+    return col
+
+
+def execute_cleaning_plan(df: pd.DataFrame, actions: Any, session: Optional[CleaningSession] = None) -> tuple[pd.DataFrame, list[dict]]:
     if session is None:
         session = CleaningSession(df)
     executed_actions = []
-    column_aliases = {column: column for column in df.columns}
+    column_aliases: Dict[str, str] = {str(column): str(column) for column in df.columns}
+
+    action_list = actions.actions if hasattr(actions, "actions") else list(actions)
 
     # Column-name normalization must happen before column-specific actions.
     sorted_actions = sorted(
-        actions,
+        action_list,
         key=lambda action: (action.action != "normalize_column_names")
     )
 
     for action in sorted_actions:
-        resolved_column = action.column
-        if resolved_column is not None:
-            resolved_column = column_aliases.get(resolved_column, resolved_column)
+        before_columns = list(df.columns)
+        resolved_column = _resolve_column_reference(action.column, before_columns, column_aliases)
 
         try:
             before_rows = len(df)
             before_missing = df.isna().sum().to_dict()
             before_dtypes = df.dtypes.astype(str).to_dict()
-            before_columns = list(df.columns)
 
             df.attrs.pop("values_replaced", None)
             df.attrs.pop("rows_dropped", None)
@@ -846,8 +870,33 @@ def execute_cleaning_plan(df: pd.DataFrame, actions: list, session: Optional[Cle
             original_action_column = action.column
             if resolved_column is not None:
                 action.column = resolved_column
+                if action.action == "rename_column" and "old_name" in action.params:
+                    action.params["old_name"] = _resolve_column_reference(action.params["old_name"], before_columns, column_aliases)
 
             df = execute_action(df, action)
+
+            # Update column aliases mapping if columns changed (e.g. normalize_column_names or rename_column)
+            after_columns = list(df.columns)
+            if after_columns != before_columns:
+                if action.action == "normalize_column_names" and len(before_columns) == len(after_columns):
+                    for old_c, new_c in zip(before_columns, after_columns):
+                        for k, v in list(column_aliases.items()):
+                            if v == old_c:
+                                column_aliases[k] = new_c
+                        column_aliases[old_c] = new_c
+                        column_aliases[new_c] = new_c
+                elif action.action == "rename_column":
+                    old_name = action.params.get("old_name", original_action_column)
+                    new_name = action.params.get("new_name")
+                    if new_name and old_name:
+                        for k, v in list(column_aliases.items()):
+                            if v == old_name:
+                                column_aliases[k] = new_name
+                        column_aliases[old_name] = new_name
+                        column_aliases[new_name] = new_name
+                for c in after_columns:
+                    if c not in column_aliases:
+                        column_aliases[c] = c
 
             # Record checkpoint in session
             checkpoint = {
@@ -856,7 +905,7 @@ def execute_cleaning_plan(df: pd.DataFrame, actions: list, session: Optional[Cle
                 "action_name": action.action,
                 "column": action.column,
                 "params": action.params,
-                "df": df.copy(deep=True),
+                "df": df,
                 "timestamp": datetime.now().isoformat(),
                 "rows": len(df),
                 "columns": list(df.columns),
@@ -868,13 +917,9 @@ def execute_cleaning_plan(df: pd.DataFrame, actions: list, session: Optional[Cle
             values_replaced = int(df.attrs.pop("values_replaced", 0) or 0)
             rows_dropped = int(df.attrs.pop("rows_dropped", 0) or 0)
 
-            if action.action != "normalize_column_names" and original_action_column is not None:
-                action.column = resolved_column
-
             after_rows = len(df)
             after_missing = df.isna().sum().to_dict()
             after_dtypes = df.dtypes.astype(str).to_dict()
-            after_columns = list(df.columns)
 
             result = {
                 "id": action.id,
@@ -1160,6 +1205,7 @@ def validate_cleaning_results(
     )
     missing_values_reduced = missing_values_after < missing_values_before
     missing_values_improved_or_unchanged = not unexpected_missing_increase
+    has_executed_actions = len(executed_actions) > 0
     all_actions_succeeded = len(failed_actions) == 0
 
     # Distinguish approved imputation status from unresolved missing values (Finding 1)
@@ -1178,6 +1224,7 @@ def validate_cleaning_results(
     }
 
     validation = {
+        "has_executed_actions": has_executed_actions,
         "rows_valid": rows_valid,
         "missing_values_reduced": missing_values_reduced,
         "missing_reduction_requested": missing_reduction_requested,

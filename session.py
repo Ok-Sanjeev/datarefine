@@ -391,11 +391,13 @@ class CleaningSession:
         }
 
     def rollback_to(self, target_step: int) -> Dict[str, Any]:
-        """Roll back DataFrame to a specific checkpoint step index."""
-        if target_step < 0 or target_step >= len(self.checkpoints):
+        """Roll back or restore DataFrame to a specific checkpoint step index across history."""
+        all_steps = [cp["step"] for cp in self.checkpoints] + [cp["step"] for cp in self.redo_stack]
+        max_step = max(all_steps) if all_steps else 0
+        if target_step < 0 or target_step > max_step:
             return {
                 "status": "error",
-                "message": f"Invalid target step {target_step}. Valid range is 0 to {len(self.checkpoints) - 1}.",
+                "message": f"Invalid target step {target_step}. Valid range is 0 to {max_step}.",
                 "current_step": self.current_step,
             }
 
@@ -406,18 +408,24 @@ class CleaningSession:
                 "message": f"Already at target step {target_step}.",
             }
 
-        # Pop into redo_stack until we reach target_step
-        while len(self.checkpoints) - 1 > target_step:
+        # If target_step < current_step: step backward into redo_stack
+        while self.current_step > target_step and len(self.checkpoints) > 1:
             popped = self.checkpoints.pop()
             self.redo_stack.append(popped)
+
+        # If target_step > current_step: step forward from redo_stack
+        while self.current_step < target_step and self.redo_stack:
+            popped = self.redo_stack.pop()
+            self.checkpoints.append(popped)
 
         # Restore target DataFrame state
         self.current_df = self.checkpoints[-1]["df"].copy(deep=True)
 
         return {
             "status": "success",
-            "restored_step": target_step,
-            "message": f"Successfully rolled back to step {target_step}.",
+            "restored_step": self.current_step,
+            "current_step": self.current_step,
+            "message": f"Successfully restored to step {self.current_step}.",
             "rows": len(self.current_df),
             "columns": list(self.current_df.columns),
             "total_checkpoints": len(self.checkpoints),
@@ -440,6 +448,7 @@ class CleaningSession:
                 "column": cp.get("column"),
                 "params": cp.get("params", {}),
                 "rows": cp.get("rows", 0),
+                "columns": cp.get("columns", []),
                 "columns_count": len(cp.get("columns", [])),
                 "timestamp": cp.get("timestamp"),
                 "description": desc,
