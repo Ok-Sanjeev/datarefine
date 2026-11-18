@@ -45,6 +45,10 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
   <style>
+    html, body {
+      max-width: 100vw;
+      overflow-x: hidden;
+    }
     body {
       background-color: #08090d;
       color: #e4e4e7;
@@ -82,14 +86,14 @@
     }
   </style>
 </head>
-<body class="min-h-screen flex flex-col antialiased selection:bg-blue-600/30 selection:text-blue-200">
+<body class="min-h-screen flex flex-col antialiased selection:bg-blue-600/30 selection:text-blue-200 overflow-x-hidden">
 
   <!-- TOAST NOTIFICATION -->
   <div id="toast" class="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-lg shadow-xl text-xs font-medium transition-all duration-200 transform translate-y-[-50px] opacity-0 flex items-center space-x-2.5 pointer-events-none border"></div>
 
   <!-- TOP WORKSPACE BAR -->
-  <header class="bg-surface-card/90 backdrop-blur-md border-b border-surface-border sticky top-0 z-40">
-    <div class="max-w-7xl mx-auto px-3 sm:px-6 h-14 flex items-center justify-between">
+  <header class="bg-surface-card/90 backdrop-blur-md border-b border-surface-border sticky top-0 z-40 w-full overflow-hidden">
+    <div class="max-w-7xl mx-auto px-3 sm:px-6 h-14 flex items-center justify-between min-w-0">
       
       <!-- Brand & Link to Homepage -->
       <div class="flex items-center space-x-2 sm:space-x-3 shrink-0">
@@ -105,10 +109,10 @@
       </div>
 
       <!-- Action & Meta Bar -->
-      <div class="flex items-center space-x-1.5 sm:space-x-3 shrink-0">
+      <div class="flex items-center space-x-1 sm:space-x-2.5 shrink-0 min-w-0">
         
         <!-- Active Session Badge (Dynamic) -->
-        <div id="session-badge" class="hidden items-center space-x-1.5 text-xs font-mono text-zinc-400 bg-surface-elevated px-2.5 py-1 rounded-md border border-surface-border">
+        <div id="session-badge" class="hidden xl:flex items-center space-x-1.5 text-xs font-mono text-zinc-400 bg-surface-elevated px-2.5 py-1 rounded-md border border-surface-border shrink-0">
           <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
           <span>Session:</span>
           <span id="current-session-id" class="text-zinc-200 font-semibold truncate max-w-[120px]">-</span>
@@ -118,7 +122,7 @@
         <div id="demo-mode-badge" onclick="openAuthModal('login')" class="flex items-center space-x-1.5 text-xs font-mono text-amber-300 bg-amber-950/40 border border-amber-800/50 px-2 sm:px-2.5 py-1 rounded-md cursor-pointer hover:bg-amber-900/40 transition shrink-0" title="You are in Guest Demo Mode (10MB limit). Click to sign in or register for persistent sessions and 50MB uploads.">
           <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
           <span>Demo Mode</span>
-          <span class="hidden md:inline text-[10px] text-amber-400/80">(10MB limit)</span>
+          <span class="hidden xl:inline text-[10px] text-amber-400/80">(10MB limit)</span>
         </div>
 
         <!-- Quick Tour Onboarding Button -->
@@ -130,7 +134,7 @@
         </button>
 
         <!-- Documentation Link -->
-        <a href="/docs" target="_blank" class="px-2.5 py-1 rounded text-xs text-zinc-400 hover:text-zinc-200 hover:bg-surface-elevated transition border border-transparent hover:border-surface-border hidden md:inline-block">
+        <a href="/docs" target="_blank" class="px-2.5 py-1 rounded text-xs text-zinc-400 hover:text-zinc-200 hover:bg-surface-elevated transition border border-transparent hover:border-surface-border hidden lg:inline-block">
           API Docs
         </a>
 
@@ -148,7 +152,7 @@
           <button id="auth-btn-signin-nav" onclick="openAuthModal('login')" class="px-2.5 py-1 rounded text-xs font-medium text-zinc-300 hover:text-white hover:bg-surface-elevated transition border border-surface-border">
             Sign In
           </button>
-          <button id="auth-btn-register-nav" onclick="openAuthModal('register')" class="px-2.5 py-1 rounded text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 transition shadow-sm hidden sm:inline-block">
+          <button id="auth-btn-register-nav" onclick="openAuthModal('register')" class="px-2.5 py-1 rounded text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 transition shadow-sm hidden md:inline-block">
             Register
           </button>
         </div>
@@ -206,12 +210,12 @@
   </div>
 
   <!-- MAIN WORKSPACE -->
-  <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-6">
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-6 min-w-0 max-w-full overflow-hidden">
 
     <!-- ============================================================ -->
     <!-- STEP 1: UPLOAD & PROFILE                                     -->
     <!-- ============================================================ -->
-    <section id="step-1" class="space-y-6">
+    <section id="step-1" class="space-y-6 min-w-0 max-w-full overflow-hidden">
       
       <!-- Primary Upload Interface -->
       <div id="upload-panel" class="bg-surface-card rounded-xl border border-surface-border p-6 space-y-6">
@@ -371,7 +375,7 @@
       </div>
 
       <!-- Profile Results Container (Appears after profiling completes) -->
-      <div id="profile-results" class="hidden space-y-6">
+      <div id="profile-results" class="hidden space-y-6 min-w-0 max-w-full">
         
         <!-- DataRefine Studio Toolbar -->
         <div class="bg-surface-elevated/80 p-1.5 rounded-xl border border-surface-border flex items-center space-x-1.5 overflow-x-auto text-xs font-medium">
@@ -396,18 +400,18 @@
         </div>
 
         <!-- TAB 1: QUALITY & PROFILING (Default) -->
-        <div id="tab-view-quality" class="space-y-6">
+        <div id="tab-view-quality" class="space-y-6 min-w-0 max-w-full">
           
           <!-- Hero Dataset Overview Card -->
           <div class="bg-surface-card p-5 rounded-xl border border-surface-border space-y-4">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-surface-border/60">
-              <div class="flex items-center space-x-3">
-                <div class="w-10 h-10 rounded-lg bg-blue-600/10 border border-blue-500/20 text-blue-400 flex items-center justify-center font-mono font-bold text-sm">
+              <div class="flex items-center space-x-3 min-w-0">
+                <div class="w-10 h-10 rounded-lg bg-blue-600/10 border border-blue-500/20 text-blue-400 flex items-center justify-center font-mono font-bold text-sm shrink-0">
                   CSV
                 </div>
-                <div>
-                  <h3 class="text-sm font-semibold text-white font-mono" id="profile-dataset-filename">-</h3>
-                  <div class="flex items-center space-x-2 text-[11px] text-zinc-400 font-mono mt-0.5">
+                <div class="min-w-0">
+                  <h3 class="text-sm font-semibold text-white font-mono truncate max-w-[260px] sm:max-w-md" id="profile-dataset-filename">-</h3>
+                  <div class="flex items-center space-x-2 text-[11px] text-zinc-400 font-mono mt-0.5 flex-wrap">
                     <span id="profile-dataset-filesize">-</span>
                     <span>·</span>
                     <span id="profile-dataset-delimiter">Delimiter: ,</span>
@@ -473,7 +477,7 @@
           </div>
 
           <!-- Dataset Preview Table with Instant Filter -->
-          <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4">
+          <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4 min-w-0 max-w-full overflow-hidden">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-300">Dataset Preview (First 15 Rows)</h3>
@@ -486,7 +490,7 @@
               </div>
             </div>
 
-            <div class="overflow-x-auto max-h-[440px] overflow-y-auto rounded-lg border border-surface-border">
+            <div class="overflow-x-auto max-h-[440px] overflow-y-auto rounded-lg border border-surface-border min-w-0 max-w-full">
               <table class="w-full text-left text-xs text-zinc-300 border-collapse" id="preview-table">
                 <thead class="sticky top-0 bg-surface-elevated text-zinc-300 text-[11px] border-b border-surface-border select-none" id="preview-table-header"></thead>
                 <tbody id="preview-table-body" class="divide-y divide-surface-border font-mono text-[11px]"></tbody>
@@ -852,7 +856,7 @@
     <!-- ============================================================ -->
     <!-- STEP 2: REVIEW & CLEAN                                       -->
     <!-- ============================================================ -->
-    <section id="step-2" class="hidden space-y-6">
+    <section id="step-2" class="hidden space-y-6 min-w-0 max-w-full overflow-hidden">
       
       <!-- Top Status Banner & Action Counters -->
       <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4">
@@ -1014,7 +1018,7 @@
     <!-- ============================================================ -->
     <!-- STEP 3: RESULTS & EXPORT                                     -->
     <!-- ============================================================ -->
-    <section id="step-3" class="hidden space-y-6">
+    <section id="step-3" class="hidden space-y-6 min-w-0 max-w-full overflow-hidden">
       
       <!-- Top Delta Metrics Summary: 6 Precision Metrics -->
       <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4">
@@ -1159,7 +1163,7 @@
       </div>
 
       <!-- Side-by-Side Visual Diff Table -->
-      <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4">
+      <div class="bg-surface-card rounded-xl border border-surface-border p-5 space-y-4 min-w-0 max-w-full overflow-hidden">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <div class="flex items-center space-x-2">
@@ -1182,7 +1186,7 @@
           </div>
         </div>
 
-        <div class="overflow-x-auto max-h-[500px] overflow-y-auto rounded-lg border border-surface-border">
+        <div class="overflow-x-auto max-h-[500px] overflow-y-auto rounded-lg border border-surface-border min-w-0 max-w-full">
           <table class="w-full text-left text-xs text-zinc-300 border-collapse" id="diff-table">
             <thead class="sticky top-0 bg-surface-elevated text-zinc-400 text-[11px] border-b border-surface-border select-none">
               <tr id="diff-table-header"></tr>
@@ -1881,9 +1885,49 @@
       return String(act).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     }
 
-    // Modal Helpers
-    function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-    function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+    // Modal Helpers & Focus Management (WCAG AA Compliance)
+    let lastFocusedElementBeforeModal = null;
+    const openModalsStack = [];
+
+    function openModal(id) {
+      const modal = document.getElementById(id);
+      if (!modal) return;
+      if (openModalsStack.length === 0) {
+        lastFocusedElementBeforeModal = document.activeElement;
+      }
+      if (!openModalsStack.includes(id)) {
+        openModalsStack.push(id);
+      }
+      modal.classList.remove('hidden');
+
+      // Set focus to the first interactive element inside the modal
+      requestAnimationFrame(() => {
+        const focusable = modal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+        if (focusable.length > 0) {
+          const primaryInput = modal.querySelector('input:not([type="hidden"]):not([disabled]):not([type="checkbox"]):not([type="radio"]), select:not([disabled]), textarea:not([disabled])') || focusable[0];
+          try { primaryInput.focus(); } catch (err) {}
+        } else {
+          modal.setAttribute('tabindex', '-1');
+          try { modal.focus(); } catch (err) {}
+        }
+      });
+    }
+
+    function closeModal(id) {
+      const modal = document.getElementById(id);
+      if (!modal) return;
+      modal.classList.add('hidden');
+      const idx = openModalsStack.lastIndexOf(id);
+      if (idx !== -1) {
+        openModalsStack.splice(idx, 1);
+      }
+      if (openModalsStack.length === 0 && lastFocusedElementBeforeModal && typeof lastFocusedElementBeforeModal.focus === 'function') {
+        try {
+          lastFocusedElementBeforeModal.focus();
+        } catch (err) {}
+        lastFocusedElementBeforeModal = null;
+      }
+    }
     function openOnboardingModal() { openModal('modal-onboarding'); }
 
     // Password Visibility & Strength Meter Helpers
@@ -4651,8 +4695,42 @@
 
     // Keyboard Shortcuts & Global Keydown Listener
     document.addEventListener('keydown', (e) => {
+      // Focus trapping inside active modal
+      if (e.key === 'Tab' && openModalsStack.length > 0) {
+        const topModalId = openModalsStack[openModalsStack.length - 1];
+        const activeModal = document.getElementById(topModalId);
+        if (activeModal && !activeModal.classList.contains('hidden')) {
+          const focusables = Array.from(activeModal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+            .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+          if (focusables.length > 0) {
+            const firstEl = focusables[0];
+            const lastEl = focusables[focusables.length - 1];
+            if (e.shiftKey) {
+              if (document.activeElement === firstEl || !activeModal.contains(document.activeElement)) {
+                e.preventDefault();
+                lastEl.focus();
+              }
+            } else {
+              if (document.activeElement === lastEl || !activeModal.contains(document.activeElement)) {
+                e.preventDefault();
+                firstEl.focus();
+              }
+            }
+          }
+        }
+      }
+
       // Escape key dismisses open modals or settings drawer
       if (e.key === 'Escape') {
+        if (openModalsStack.length > 0) {
+          const topModalId = openModalsStack[openModalsStack.length - 1];
+          if (topModalId === 'modal-destructive-confirm') {
+            closeDestructiveConfirmModal(false);
+          } else {
+            closeModal(topModalId);
+          }
+          return;
+        }
         const modals = ['modal-auth', 'modal-user-sessions', 'modal-col-detail', 'modal-add-operation', 'modal-export-script', 'modal-onboarding', 'modal-destructive-confirm'];
         for (const mId of modals) {
           const m = document.getElementById(mId);

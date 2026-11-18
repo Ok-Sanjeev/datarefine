@@ -41,6 +41,7 @@ from server import (
     sanitize_value_for_json,
     compute_side_by_side_diff,
     SESSIONS,
+    limiter,
 )
 from grel_engine import (
     execute_grel_transform,
@@ -58,6 +59,13 @@ from reconciliation import (
     reconcile_column_values,
 )
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def reset_limiter_before_each():
+    limiter.reset()
+    yield
+    limiter.reset()
 
 
 @pytest.fixture
@@ -388,13 +396,12 @@ def test_execution_analytics_no_operations_selected(test_client):
     csv_content = b"id,name,age\n1,Alice,30\n2,Bob,25\n"
     session_id, token = create_test_session(test_client, csv_content, "test_none.csv")
 
-    # Request plan
-    plan_res = test_client.post(
-        "/api/plan",
-        headers={"X-Session-Token": token},
-        json={"session_id": session_id},
+    # Set session plan with candidate action
+    session_data = SESSIONS.get_session(session_id)
+    session_data["plan"] = CleaningPlan(
+        summary="Test plan",
+        actions=[CleaningAction(action="trim_whitespace", column="name", params={}, reasoning="test")]
     )
-    assert plan_res.status_code == 200
 
     # Call /api/clean with NO approved actions
     clean_res = test_client.post(

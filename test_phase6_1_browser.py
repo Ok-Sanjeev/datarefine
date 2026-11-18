@@ -18,8 +18,22 @@ import threading
 import pytest
 import uvicorn
 from playwright.sync_api import sync_playwright
+from unittest.mock import patch
+from schemas import CleaningPlan, CleaningAction
 
 from server import app, SESSIONS, limiter
+
+MOCK_ACTIONS = [
+    CleaningAction(action="trim_whitespace", column="name", params={}, reasoning="Clean names", risk_level="green", risk_label="Safe Repair"),
+    CleaningAction(action="impute_missing", column="age", params={"method": "median"}, reasoning="Fill missing age", risk_level="yellow", risk_label="Needs Review"),
+]
+MOCK_PLAN = CleaningPlan(summary="Deterministic Test Plan", actions=MOCK_ACTIONS)
+
+
+@pytest.fixture(autouse=True)
+def mock_gemini_planner():
+    with patch("server.generate_validated_plan", return_value=(MOCK_PLAN, "mock text")):
+        yield
 
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 if not os.path.exists(CHROME_PATH):
