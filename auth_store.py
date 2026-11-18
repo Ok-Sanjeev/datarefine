@@ -37,7 +37,28 @@ DEFAULT_AUTH_TOKEN_HOURS = int(os.getenv("AUTH_TOKEN_HOURS", "72"))  # 3 days
 PASSWORD_RESET_TOKEN_MINUTES = int(os.getenv("PASSWORD_RESET_TOKEN_MINUTES", "60"))  # 1 hour
 OAUTH_STATE_TIMEOUT_MINUTES = int(os.getenv("OAUTH_STATE_TIMEOUT_MINUTES", "10"))  # 10 minutes
 REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() in ("true", "1")
-DEFAULT_SECRET_KEY = os.getenv("SECRET_KEY", "datarefine_production_security_key_please_change_in_production")
+FALLBACK_DEV_SECRET = "datarefine_production_security_key_please_change_in_production"
+DEFAULT_SECRET_KEY = FALLBACK_DEV_SECRET
+
+
+def get_secret_key() -> str:
+    """
+    Retrieve the server SECRET_KEY.
+    In production mode (ENVIRONMENT=production), an explicitly configured
+    secret of at least 32 characters is strictly required. The development fallback is rejected.
+    """
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    secret = os.getenv("SECRET_KEY", "").strip()
+    if env in ("production", "prod"):
+        if not secret or secret == FALLBACK_DEV_SECRET or len(secret) < 32:
+            raise ValueError(
+                "Security violation: In production (ENVIRONMENT=production), "
+                "a secure random SECRET_KEY of at least 32 characters must be explicitly configured "
+                "via environment variables. The hardcoded development fallback is rejected."
+            )
+        return secret
+    return secret or FALLBACK_DEV_SECRET
+
 
 
 # =====================================================================
@@ -133,10 +154,10 @@ def _derive_fernet_key(secret_str: str) -> bytes:
 def get_fernet_suite() -> MultiFernet:
     """
     Construct MultiFernet encryption suite supporting zero-downtime key rotation.
-    Primary key: os.getenv("SECRET_KEY", DEFAULT_SECRET_KEY).
+    Primary key: validated via get_secret_key().
     Rotation fallback keys: os.getenv("SECRET_KEY_ROTATION_FALLBACKS", "").
     """
-    primary = os.getenv("SECRET_KEY", DEFAULT_SECRET_KEY)
+    primary = get_secret_key()
     keys = [_derive_fernet_key(primary)]
     fallbacks = os.getenv("SECRET_KEY_ROTATION_FALLBACKS", "")
     if fallbacks:

@@ -1,0 +1,14 @@
+# Cloudflare Pages Routing and Reverse Proxy Configuration
+# 1. API Reverse Proxy to Render Free backend
+# Default backend URL is https://datarefine-backend.onrender.com
+# Update this origin if your Render service has a custom name or domain.
+/api/*  https://datarefine-backend.onrender.com/api/:splat  200
+
+# 2. Application Workspace SPA Rewrites
+/app        /app.html  200
+/app/*      /app.html  200
+/ui         /app.html  200
+/ui/*       /app.html  200
+
+# 3. Landing Page and Global Static Fallback
+/*          /index.html 200

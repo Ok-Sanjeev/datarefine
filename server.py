@@ -123,6 +123,11 @@ ALLOWED_ORIGINS, ALLOW_CREDENTIALS = validate_cors_origins(
     environment=ENVIRONMENT,
 )
 
+if ENVIRONMENT in ("production", "prod"):
+    # Enforce production SECRET_KEY requirement immediately on startup
+    from auth_store import get_secret_key
+    get_secret_key()
+
 # 1. Security Response Headers Middleware
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -3189,8 +3194,11 @@ def workspace_page():
 
 
 @app.exception_handler(404)
-async def custom_404_handler(request, exc):
-    """Clean, branded 404 page for unknown routes."""
+async def custom_404_handler(request: Request, exc):
+    """Clean, branded 404 page for unknown routes, returning JSON for API requests."""
+    if request.url.path.startswith("/api/"):
+        detail = getattr(exc, "detail", "Not Found")
+        return JSONResponse(status_code=404, content={"detail": detail})
     return HTMLResponse(
         content="""<!DOCTYPE html>
 <html lang="en" class="dark">

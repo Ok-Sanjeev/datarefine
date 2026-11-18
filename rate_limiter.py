@@ -90,11 +90,13 @@ limiter = IPRateLimiter()
 
 def get_rate_limit_configs() -> Dict[str, Any]:
     """Load configurable rate limits from environment variables."""
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    default_fallback = "false" if env in ("production", "prod") else "true"
     return {
         "global_per_minute": int(os.getenv("GLOBAL_RATE_LIMIT_PER_MINUTE", "120")),
         "ai_per_minute": int(os.getenv("AI_RATE_LIMIT_PER_MINUTE", "10")),
         "ai_server_key_per_hour": int(os.getenv("AI_SERVER_KEY_LIMIT_PER_HOUR", "20")),
-        "allow_server_gemini_fallback": os.getenv("ALLOW_SERVER_GEMINI_FALLBACK", "true").lower() in ("true", "1", "yes"),
+        "allow_server_gemini_fallback": os.getenv("ALLOW_SERVER_GEMINI_FALLBACK", default_fallback).lower() in ("true", "1", "yes"),
     }
 
 

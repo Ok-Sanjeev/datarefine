@@ -91,6 +91,12 @@
   <!-- TOAST NOTIFICATION -->
   <div id="toast" class="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-lg shadow-xl text-xs font-medium transition-all duration-200 transform translate-y-[-50px] opacity-0 flex items-center space-x-2.5 pointer-events-none border"></div>
 
+  <!-- FREE INSTANCE COLD-START WAKE-UP INDICATOR -->
+  <div id="cold-start-banner" class="fixed top-16 left-1/2 transform -translate-x-1/2 z-50 px-3.5 py-1.5 rounded-full shadow-2xl text-[11px] font-medium transition-all duration-300 opacity-0 pointer-events-none bg-blue-950/90 text-blue-200 border border-blue-700/60 backdrop-blur-md flex items-center space-x-2">
+    <span class="w-2 h-2 rounded-full bg-blue-400 animate-ping"></span>
+    <span id="cold-start-banner-text">Connecting to server (free instance waking up, ~45s)...</span>
+  </div>
+
   <!-- TOP WORKSPACE BAR -->
   <header class="bg-surface-card/90 backdrop-blur-md border-b border-surface-border sticky top-0 z-40 w-full overflow-hidden">
     <div class="max-w-7xl mx-auto px-3 sm:px-6 h-14 flex items-center justify-between min-w-0">
@@ -1814,10 +1820,49 @@
       return match ? decodeURIComponent(match[2]) : null;
     }
 
+    // Free-tier cold-start indicator tracking (shows minimal non-intrusive banner if an API call takes > 3.5s)
+    let _activeApiRequests = 0;
+    let _coldStartTimer = null;
+
+    function _trackApiStart() {
+      _activeApiRequests++;
+      if (!_coldStartTimer) {
+        _coldStartTimer = setTimeout(() => {
+          if (_activeApiRequests > 0) {
+            const banner = document.getElementById('cold-start-banner');
+            if (banner) {
+              banner.classList.remove('opacity-0', 'pointer-events-none');
+              banner.classList.add('opacity-100');
+            }
+          }
+        }, 3500);
+      }
+    }
+
+    function _trackApiEnd() {
+      _activeApiRequests = Math.max(0, _activeApiRequests - 1);
+      if (_activeApiRequests === 0) {
+        if (_coldStartTimer) {
+          clearTimeout(_coldStartTimer);
+          _coldStartTimer = null;
+        }
+        const banner = document.getElementById('cold-start-banner');
+        if (banner) {
+          banner.classList.remove('opacity-100');
+          banner.classList.add('opacity-0', 'pointer-events-none');
+        }
+      }
+    }
+
     // Intercept fetch to automatically include Authorization Bearer, CSRF Token, and X-Session-Token
     const _nativeFetch = window.fetch;
     window.fetch = function(url, init = {}) {
+      let targetUrl = url;
+      const apiBase = window.DATAREFINE_API_BASE || '';
+      const isApi = (typeof url === 'string') && (url.startsWith('/api/') || (apiBase && url.startsWith(apiBase)));
+
       if (typeof url === 'string' && url.startsWith('/api/')) {
+        targetUrl = apiBase ? (apiBase.replace(/\/+$/, '') + url) : url;
         init = init || {};
         init.headers = init.headers || {};
         init.credentials = init.credentials || 'same-origin';
@@ -1854,7 +1899,27 @@
           }
         }
       }
-      return _nativeFetch.call(this, url, init);
+
+      if (isApi) {
+        _trackApiStart();
+        return _nativeFetch.call(this, targetUrl, init).then(async (res) => {
+          // If session is 404 (e.g. after backend restart/sleep), provide clear feedback
+          if (res.status === 404 && typeof targetUrl === 'string' && targetUrl.includes('/api/') && !targetUrl.includes('/api/auth/') && !targetUrl.includes('/api/health')) {
+            try {
+              const clone = res.clone();
+              const errJson = await clone.json();
+              if (errJson && errJson.detail && errJson.detail.includes('Session not found')) {
+                showToast('Session expired or reset after server sleep. Please reload your dataset.', true);
+              }
+            } catch (e) {}
+          }
+          return res;
+        }).finally(() => {
+          _trackApiEnd();
+        });
+      }
+
+      return _nativeFetch.call(this, targetUrl, init);
     };
 
     // Robust HTML Escaping Utility to prevent DOM XSS
