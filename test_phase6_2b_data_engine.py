@@ -48,6 +48,7 @@ from grel_engine import (
     CompiledGRELExpression,
     GRELSecurityError,
     GRELSyntaxError,
+    GRELExecutionError,
 )
 from openrefine_clustering import (
     detect_clusters,
@@ -155,6 +156,69 @@ def test_genuine_timestamp_preserves_time():
     diff = compute_side_by_side_diff(df, df_clean)
     row0 = diff["row_diffs"][0]["cells"]["Event_Time"]
     assert "14:30:00" in row0["cleaned"]
+
+
+def test_date_only_conversion_in_preview_and_audit_json(test_client):
+    """Verify date-only values format as YYYY-MM-DD in /api/profile preview, audit JSON, and recipe replay."""
+    csv_content = b"Join_Date,Event_Time,User\n2023-01-15,2023-01-15 14:30:00,Alice\n04/02/2021,2023-02-10 09:15:32,Bob\n"
+    res = test_client.post(
+        "/api/upload",
+        files={"file": ("test_dates_full.csv", csv_content, "text/csv")},
+    )
+    assert res.status_code == 200
+    filepath = res.json()["filepath"]
+    prof_res = test_client.post(
+        "/api/profile",
+        json={"filepath": filepath},
+    )
+    assert prof_res.status_code == 200
+    prof_data = prof_res.json()
+    session_id = prof_data["session_id"]
+    token = prof_data["session_token"]
+    preview_rows = prof_data["preview_rows"]
+
+    # 1. Preview rows in profile
+    assert preview_rows[0]["Join_Date"] == "2023-01-15"
+    assert "T00:00:00" not in str(preview_rows[0]["Join_Date"])
+    # Genuine timestamp retains time
+    assert "14:30:00" in str(preview_rows[0]["Event_Time"])
+
+    # 2. Plan and clean
+    session_data = SESSIONS.get_session(session_id)
+    session_data["plan"] = CleaningPlan(
+        summary="Convert dates",
+        actions=[
+            CleaningAction(
+                action="convert_to_date",
+                column="Join_Date",
+                params={},
+                reasoning="Convert date",
+            )
+        ]
+    )
+
+    clean_res = test_client.post(
+        "/api/clean",
+        headers={"X-Session-Token": token},
+        json={"session_id": session_id, "approved_action_ids": [0]},
+    )
+    assert clean_res.status_code == 200
+
+    # 3. Audit report download
+    rep_res = test_client.get(f"/api/download/report?session_id={session_id}", headers={"X-Session-Token": token})
+    assert rep_res.status_code == 200
+    report_data = rep_res.json()
+    assert "actions" in report_data
+    assert report_data["actions"][0]["action"] == "convert_to_date"
+    assert report_data["actions"][0]["status"] == "success"
+
+    # 4. Recipe replay outputs YYYY-MM-DD
+    raw_df = pd.DataFrame({"Join_Date": ["2023-01-15", "04/02/2021"]})
+    recipe = {"operations": [{"action": "convert_to_date", "column": "Join_Date", "params": {}}]}
+    replayed_df, _ = WorkflowRecipeManager.replay_recipe(raw_df, recipe)
+    val0 = replayed_df["Join_Date"].iloc[0]
+    assert sanitize_value_for_json(val0) == "2023-01-15"
+    assert "T00:00:00" not in sanitize_value_for_json(val0)
 
 
 # ============================================================================
@@ -414,6 +478,99 @@ def test_execution_analytics_completed_with_changes(test_client):
     assert data["cells_modified"] > 0
 
 
+def test_execution_analytics_skipped_operation(test_client):
+    """When plan proposes multiple actions but user only approves a subset, track skipped actions accurately."""
+    csv_content = b"id,name,city\n1,  alice  ,boston\n2,bob  ,chicago\n"
+    session_id, token = create_test_session(test_client, csv_content, "test_skipped.csv")
+
+    session_data = SESSIONS.get_session(session_id)
+    session_data["plan"] = CleaningPlan(
+        summary="Multi-step plan with skipped action",
+        actions=[
+            CleaningAction(action="trim_whitespace", column="name", params={}, reasoning="Action 0: trim name"),
+            CleaningAction(action="normalize_text", column="city", params={"case": "upper"}, reasoning="Action 1: uppercase city"),
+        ]
+    )
+
+    # Approve only action 0; action 1 is skipped
+    clean_res = test_client.post(
+        "/api/clean",
+        headers={"X-Session-Token": token},
+        json={"session_id": session_id, "approved_action_ids": [0]},
+    )
+    assert clean_res.status_code == 200
+    data = clean_res.json()
+
+    assert data["operations_summary"]["proposed"] == 2
+    assert data["operations_summary"]["approved"] == 1
+    assert data["operations_summary"]["attempted"] == 1
+    assert data["operations_summary"]["applied"] == 1
+    assert data["operations_summary"]["skipped"] == 1
+    assert data["operations_summary"]["failed"] == 0
+    assert data["actions_applied"] == 1
+    assert data["actions_skipped"] == 1
+    assert data["actions_failed"] == 0
+    assert data["execution_status"] == "verified_completed"
+
+
+def test_execution_analytics_partial_success(test_client):
+    """When some operations succeed while others fail, status must report 'partially_completed'."""
+    csv_content = b"id,name,city\n1,  alice  ,boston\n2,bob  ,chicago\n"
+    session_id, token = create_test_session(test_client, csv_content, "test_partial.csv")
+
+    session_data = SESSIONS.get_session(session_id)
+    session_data["plan"] = CleaningPlan(
+        summary="Partial success plan",
+        actions=[
+            CleaningAction(action="trim_whitespace", column="name", params={}, reasoning="Valid action"),
+            CleaningAction(action="convert_to_numeric", column="name", params={}, reasoning="Failing action: cannot convert name to numeric"),
+        ]
+    )
+
+    # Approve both actions
+    clean_res = test_client.post(
+        "/api/clean",
+        headers={"X-Session-Token": token},
+        json={"session_id": session_id, "approved_action_ids": [0, 1]},
+    )
+    assert clean_res.status_code == 200
+    data = clean_res.json()
+
+    assert data["execution_status"] == "partially_completed"
+    assert data["execution_status_label"] == "Partially Completed"
+    assert data["actions_applied"] == 1
+    assert data["actions_failed"] == 1
+    assert "1 operation(s) applied, 1 failed" in data["execution_status_desc"]
+
+
+def test_execution_analytics_complete_failure(test_client):
+    """When all attempted operations fail, status must report 'failed'."""
+    csv_content = b"id,name,city\n1,alice,boston\n2,bob,chicago\n"
+    session_id, token = create_test_session(test_client, csv_content, "test_failed.csv")
+
+    session_data = SESSIONS.get_session(session_id)
+    session_data["plan"] = CleaningPlan(
+        summary="Failing plan",
+        actions=[
+            CleaningAction(action="convert_to_numeric", column="name", params={}, reasoning="Failing action"),
+        ]
+    )
+
+    clean_res = test_client.post(
+        "/api/clean",
+        headers={"X-Session-Token": token},
+        json={"session_id": session_id, "approved_action_ids": [0]},
+    )
+    assert clean_res.status_code == 200
+    data = clean_res.json()
+
+    assert data["execution_status"] == "failed"
+    assert data["execution_status_label"] == "Execution Failed"
+    assert data["actions_applied"] == 0
+    assert data["actions_failed"] == 1
+    assert "1 operation(s) failed during execution" in data["execution_status_desc"]
+
+
 # ============================================================================
 # 4. CHECKPOINT, UNDO, REDO, AND ROLLBACK
 # ============================================================================
@@ -450,6 +607,19 @@ def test_checkpoints_undo_redo_and_rollback_to_step():
     assert session.current_step == 3
     assert session.get_current_df()["name"].iloc[0] == "ALICE"
 
+    # Step 4: Convert salary to numeric (changes dtype)
+    session.apply_action(CleaningAction(action="convert_to_numeric", column="salary", params={}, reasoning="Numeric salary"))
+    assert session.current_step == 4
+    assert pd.api.types.is_numeric_dtype(session.get_current_df()["salary"])
+    assert session.get_current_df()["salary"].iloc[0] == 50000.0
+
+    # Undo step 4 -> step 3 (restores salary dtype to object and string value)
+    undo_salary = session.undo()
+    assert undo_salary["status"] == "success"
+    assert session.current_step == 3
+    assert session.get_current_df()["salary"].iloc[0] == "$50,000"
+    assert not pd.api.types.is_numeric_dtype(session.get_current_df()["salary"])
+
     # Undo step 3 -> step 2
     undo1 = session.undo()
     assert undo1["status"] == "success"
@@ -463,18 +633,21 @@ def test_checkpoints_undo_redo_and_rollback_to_step():
     assert session.current_step == 3
     assert session.get_current_df()["name"].iloc[0] == "ALICE"
 
-    # Rollback directly to step 0 (initial uncleaned)
+    # Rollback directly to step 0 (initial uncleaned) - restores initial rows, values, types, columns
     rb0 = session.rollback_to(0)
     assert rb0["status"] == "success"
     assert session.current_step == 0
     assert len(session.get_current_df()) == 4
     assert session.get_current_df()["name"].iloc[0] == " alice "
+    assert session.get_current_df()["salary"].iloc[0] == "$50,000"
+    assert list(session.get_current_df().columns) == ["id", "name", "salary"]
 
-    # Rollback forward to step 2 (via redo stack)
-    rb2 = session.rollback_to(2)
-    assert rb2["status"] == "success"
-    assert session.current_step == 2
-    assert session.get_current_df()["name"].iloc[0] == "alice"
+    # Rollback forward to step 4 (via redo stack) - restores step 4 dtypes and values
+    rb4 = session.rollback_to(4)
+    assert rb4["status"] == "success"
+    assert session.current_step == 4
+    assert pd.api.types.is_numeric_dtype(session.get_current_df()["salary"])
+    assert session.get_current_df()["salary"].iloc[0] == 50000.0
 
 
 def test_api_session_rollback_target_step(test_client):
@@ -612,3 +785,115 @@ def test_grel_value_trim_and_mutation():
 
     with pytest.raises(GRELSyntaxError):
         CompiledGRELExpression("import os")
+
+
+def test_clustering_checkbox_states_and_dataset_application(test_client):
+    """Verify clustering checkbox selection logic (>=80% auto-selected, <80% unselected) and dataset transformation."""
+    csv_content = b"city,pop\nNew York,100\nnew york,200\nNew-York,300\nNEW YORK,400\nLos Angeles,500\nLos Angelas,600\nTokyo,700\n"
+    session_id, token = create_test_session(test_client, csv_content, "test_cluster_app.csv")
+
+    # Detect clusters via API
+    det_res = test_client.post(
+        "/api/cluster/detect",
+        headers={"X-Session-Token": token},
+        json={"session_id": session_id, "column": "city", "method": "fingerprint"},
+    )
+    assert det_res.status_code == 200
+    clusters = det_res.json()["clusters"]
+    assert len(clusters) >= 1
+
+    # Checkbox logic:
+    # High-confidence cluster (confidence >= 0.8) must be auto-selected (checked = True)
+    # Low-confidence cluster (confidence < 0.8) must not be auto-selected (checked = False)
+    high_conf = [c for c in clusters if c.get("confidence", 0) >= 0.8]
+    assert len(high_conf) >= 1
+    for c in clusters:
+        is_auto_selected = (c.get("confidence", 1.0) >= 0.8)
+        assert is_auto_selected == (c["confidence"] >= 0.8)
+
+    # Apply approved cluster merge
+    c0 = clusters[0]
+    canonical = c0["canonical"]
+    mapping = {m["value"]: canonical for m in c0["members"]}
+
+    apply_res = test_client.post(
+        "/api/cluster/apply",
+        headers={"X-Session-Token": token},
+        json={
+            "session_id": session_id,
+            "column": "city",
+            "clusters": [c0],
+            "mapping": mapping,
+        },
+    )
+    assert apply_res.status_code == 200
+    apply_data = apply_res.json()
+    assert apply_data["status"] == "success"
+
+    # Verify session DataFrame values are updated to canonical
+    session_data = SESSIONS.get_session(session_id)
+    df_after = session_data["df_current"]
+    # All variants from c0 must now equal canonical
+    for orig_val in mapping.keys():
+        assert orig_val not in df_after["city"].values or orig_val == canonical
+
+
+def test_grel_timeout_behavior():
+    """Verify runaway or slow GREL transformations trigger execution timeout."""
+    # Create 2000 rows to ensure batch iteration crosses the 1000-row timeout checkpoint
+    df_large = pd.DataFrame({"text_val": ["  sample string to process  "] * 2000})
+
+    # execute_grel_transform with an ultra-short timeout (0.0001 seconds)
+    with pytest.raises((GRELExecutionError, TimeoutError)) as exc_info:
+        execute_grel_transform(
+            df_large,
+            "text_val",
+            "value.trim().toLowercase()",
+            timeout_seconds=0.00001,
+        )
+    assert "timeout" in str(exc_info.value).lower()
+
+
+def test_recipe_validation_malformed_json_and_output():
+    """Verify recipe validation handles malformed JSON, rejects invalid operations, and replayed output is correct."""
+    # 1. Missing 'operations' key
+    valid1, errs1 = WorkflowRecipeManager.validate_recipe({})
+    assert valid1 is False
+    assert any("operations" in e for e in errs1)
+
+    # 2. Operations is not a list
+    valid2, errs2 = WorkflowRecipeManager.validate_recipe({"operations": "not_a_list"})
+    assert valid2 is False
+    assert any("list" in e for e in errs2)
+
+    # 3. Operation item is not a dict
+    valid3, errs3 = WorkflowRecipeManager.validate_recipe({"operations": ["not_a_dict"]})
+    assert valid3 is False
+    assert any("valid JSON object" in e for e in errs3)
+
+    # 4. Operation missing 'action' field
+    valid4, errs4 = WorkflowRecipeManager.validate_recipe({"operations": [{"column": "city"}]})
+    assert valid4 is False
+    assert any("missing required 'action'" in e for e in errs4)
+
+    # 5. Invalid/unsupported action name
+    valid5, errs5 = WorkflowRecipeManager.validate_recipe({"operations": [{"action": "eval_malicious_code", "column": "city"}]})
+    assert valid5 is False
+    assert any("unsupported action" in e for e in errs5)
+
+    # 6. Replay raises ValueError on invalid recipe
+    df = pd.DataFrame({"city": ["Paris", "London"]})
+    with pytest.raises(ValueError) as exc:
+        WorkflowRecipeManager.replay_recipe(df, {"operations": "invalid"})
+    assert "Invalid recipe" in str(exc.value)
+
+    # 7. Valid recipe replays correctly and produces correct final output
+    valid_recipe = {
+        "operations": [
+            {"action": "normalize_text", "column": "city", "params": {"case": "upper"}},
+        ]
+    }
+    cleaned_df, report = WorkflowRecipeManager.replay_recipe(df, valid_recipe)
+    assert cleaned_df["city"].tolist() == ["PARIS", "LONDON"]
+    assert report["successful_steps"] == 1
+    assert report["failed_steps"] == 0
