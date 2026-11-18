@@ -1255,21 +1255,38 @@
           </div>
 
           <div>
-            <label class="block text-zinc-300 font-medium mb-1">Model Name</label>
-            <input type="text" id="settings-model" value="gemini-2.5-flash" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500 font-mono">
+            <div class="flex items-center justify-between mb-1">
+              <label class="block text-zinc-300 font-medium">Compatible Model</label>
+              <span id="settings-model-badge" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-elevated text-blue-400 border border-surface-border">Auto-Filtered</span>
+            </div>
+            <select id="settings-model-select" onchange="onModelSelectChange(this.value)" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500 font-mono">
+              <option value="gemini-2.5-flash" selected>gemini-2.5-flash (Recommended Flash)</option>
+              <option value="gemini-2.5-pro">gemini-2.5-pro (Deep Reasoning)</option>
+              <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+              <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+            </select>
+            <div id="settings-custom-model-wrap" class="hidden mt-2">
+              <input type="text" id="settings-custom-model" placeholder="Custom model tag (e.g. llama3:8b, mistral-nemo)" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500 font-mono">
+            </div>
+            <input type="hidden" id="settings-model" value="gemini-2.5-flash">
           </div>
 
           <div>
-            <label class="block text-zinc-300 font-medium mb-1">API Key (Optional override)</label>
-            <input type="password" id="settings-api-key" placeholder="Defaults to server environment variable" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500 font-mono">
+            <div class="flex items-center justify-between mb-1">
+              <label id="settings-api-key-label" class="block text-zinc-300 font-medium">API Key (Optional override)</label>
+              <span id="settings-key-badge" class="text-[10px] font-mono text-emerald-400">Server Key Active</span>
+            </div>
+            <input type="password" id="settings-api-key" placeholder="Defaults to server GEMINI_API_KEY" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500 font-mono">
+            <p id="settings-api-key-help" class="text-[11px] text-zinc-400 mt-1">Google Gemini is active with the server-side key. Personal key is optional.</p>
             
             <div id="settings-save-key-opt" class="hidden mt-2 flex items-center space-x-2">
               <input type="checkbox" id="settings-save-key" class="rounded bg-surface-elevated border-surface-border text-blue-500 focus:ring-0">
-              <label for="settings-save-key" class="text-[11px] text-zinc-300 select-none cursor-pointer">Save API key to my account (Encrypted at rest)</label>
+              <label for="settings-save-key" class="text-[11px] text-zinc-300 select-none cursor-pointer">Save API key to my account for this provider (Encrypted at rest)</label>
             </div>
 
             <div id="settings-saved-key-box" class="hidden mt-2 p-2 rounded bg-surface-elevated border border-surface-border text-[11px] flex items-center justify-between">
-              <span class="text-zinc-400">Stored Key: <span id="settings-key-preview" class="text-emerald-400 font-mono font-medium">-</span></span>
+              <span class="text-zinc-400">Stored Key (<span id="settings-key-provider-label">gemini</span>): <span id="settings-key-preview" class="text-emerald-400 font-mono font-medium">-</span></span>
               <button type="button" onclick="deleteSavedApiKey()" class="text-rose-400 hover:text-rose-300 font-medium text-[11px] underline">Delete Saved Key</button>
             </div>
           </div>
@@ -1501,17 +1518,6 @@
             Sign In
           </button>
         </div>
-        <div class="pt-1 text-center">
-          <button type="button" onclick="handleGoogleOAuth()" class="w-full py-2 rounded-lg bg-surface-elevated hover:bg-zinc-800 border border-surface-border text-zinc-300 text-xs font-medium flex items-center justify-center space-x-2 transition">
-            <svg class="w-4 h-4" viewBox="0 0 24 24">
-              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
-              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
-            </svg>
-            <span>Continue with Google</span>
-          </button>
-        </div>
       </form>
 
       <!-- Tab Panel: Register -->
@@ -1562,7 +1568,7 @@
               <label class="block text-zinc-300 font-medium mb-1">Account Email</label>
               <input type="email" id="auth-reset-email" placeholder="you@example.com" class="w-full px-3 py-2 rounded-lg bg-surface-elevated border border-surface-border text-zinc-200 text-xs focus:outline-none focus:border-blue-500">
             </div>
-            <button type="button" onclick="handlePasswordResetRequest()" class="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition">
+            <button type="button" id="auth-btn-reset-request" onclick="handlePasswordResetRequest()" class="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition">
               Request Reset Token
             </button>
           </div>
@@ -1581,10 +1587,34 @@
               <button type="button" onclick="togglePasswordVisibility('auth-reset-new-password', this)" class="absolute right-2.5 top-2.5 text-zinc-400 hover:text-zinc-200 text-xs" title="Toggle password visibility">👁</button>
             </div>
           </div>
-          <button type="button" onclick="handlePasswordResetConfirm()" class="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition">
+          <button type="button" id="auth-btn-reset-confirm" onclick="handlePasswordResetConfirm()" class="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition">
             Set New Password
           </button>
         </div>
+
+        <!-- Return to Sign In Link -->
+        <div class="pt-2 text-center">
+          <button type="button" onclick="switchAuthTab('login')" class="text-xs text-blue-400 hover:text-blue-300 hover:underline transition">
+            ← Return to Sign In
+          </button>
+        </div>
+      </div>
+
+      <!-- Shared Google Authentication (Always Visible Across All Tabs) -->
+      <div id="auth-google-section" class="pt-3 border-t border-surface-border text-center space-y-2">
+        <div class="relative flex items-center justify-center">
+          <div class="border-t border-surface-border w-full"></div>
+          <span class="bg-surface-card px-2 text-[10px] text-zinc-500 uppercase font-mono tracking-wider absolute">Or</span>
+        </div>
+        <button type="button" id="auth-btn-google" onclick="handleGoogleOAuth()" class="w-full py-2.5 rounded-lg bg-surface-elevated hover:bg-zinc-800 border border-surface-border text-zinc-200 text-xs font-medium flex items-center justify-center space-x-2 transition shadow-sm" title="Sign in with your Google account">
+          <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+          </svg>
+          <span id="auth-google-text">Continue with Google</span>
+        </button>
       </div>
 
       <!-- Frictionless Guest Demo Mode Link -->
@@ -1741,6 +1771,38 @@
     let currentPlan = null;
     let currentDiffData = null;
     let showChangedDiffOnly = false;
+    let userAccountPreferences = null;
+
+    const COMPATIBLE_MODELS_MAP = {
+      gemini: [
+        { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Flash)' },
+        { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro (Deep Reasoning)' },
+        { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+        { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+        { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' }
+      ],
+      openai: [
+        { value: 'gpt-4o-mini', label: 'gpt-4o-mini (Recommended Fast)' },
+        { value: 'gpt-4o', label: 'gpt-4o (Omni Reasoning)' },
+        { value: 'gpt-4-turbo', label: 'gpt-4-turbo' },
+        { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' }
+      ],
+      anthropic: [
+        { value: 'claude-3-5-sonnet-20241022', label: 'claude-3-5-sonnet-20241022 (Recommended)' },
+        { value: 'claude-3-5-haiku-20241022', label: 'claude-3-5-haiku-20241022 (Fast)' },
+        { value: 'claude-3-opus-20240229', label: 'claude-3-opus-20240229' }
+      ],
+      ollama: [
+        { value: 'llama3.2', label: 'llama3.2 (Default Local)' },
+        { value: 'llama3.1', label: 'llama3.1' },
+        { value: 'mistral', label: 'mistral' },
+        { value: 'qwen2.5-coder', label: 'qwen2.5-coder' },
+        { value: 'custom', label: 'Custom Ollama Model Tag...' }
+      ],
+      mock: [
+        { value: 'mock-cleaner', label: 'mock-cleaner (Deterministic Test Engine)' }
+      ]
+    };
 
     // Cookie Helper
     function getCookie(name) {
@@ -1911,27 +1973,34 @@
       }
     }
     async function toggleSettingsDrawer(open) {
-      document.getElementById('drawer-settings').classList.toggle('hidden', !open);
-      if (open && currentUser) {
+      const drawer = document.getElementById('drawer-settings');
+      if (!drawer) return;
+      drawer.classList.toggle('hidden', !open);
+      if (!open) return;
+
+      if (currentUser) {
         document.getElementById('settings-save-key-opt')?.classList.remove('hidden');
         try {
           const res = await fetch('/api/user/preferences');
           if (res.ok) {
             const data = await res.json();
-            const prefs = data.preferences || {};
-            const savedBox = document.getElementById('settings-saved-key-box');
-            if (prefs.has_custom_api_key && prefs.custom_api_key_preview) {
-              savedBox.classList.remove('hidden');
-              document.getElementById('settings-key-preview').textContent = prefs.custom_api_key_preview;
-            } else {
-              savedBox.classList.add('hidden');
+            userAccountPreferences = data.preferences || {};
+            if (userAccountPreferences.default_provider) {
+              const provSelect = document.getElementById('settings-provider');
+              if (provSelect) provSelect.value = userAccountPreferences.default_provider;
             }
           }
         } catch (_) {}
-      } else if (open) {
+      } else {
         document.getElementById('settings-save-key-opt')?.classList.add('hidden');
         document.getElementById('settings-saved-key-box')?.classList.add('hidden');
       }
+
+      const activeProvider = document.getElementById('settings-provider')?.value || 'gemini';
+      const preferredModel = (userAccountPreferences && userAccountPreferences.default_provider === activeProvider)
+        ? userAccountPreferences.default_model
+        : null;
+      onProviderChange(activeProvider, preferredModel);
     }
 
     // Multi-Tenant Authentication & Session Management
@@ -2168,14 +2237,15 @@
     }
 
     async function handleGoogleOAuth() {
+      setAuthFeedback('Connecting to Google authentication...', false);
       try {
         const res = await fetch('/api/auth/google/url');
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Google OAuth unavailable');
+        if (!res.ok) throw new Error(data.detail || 'Google authentication is temporarily unavailable.');
         if (data.auth_url) {
           window.location.href = data.auth_url;
         } else {
-          throw new Error('Google OAuth is not configured on this server.');
+          throw new Error('Google authentication is temporarily unavailable: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not configured on the server.');
         }
       } catch (err) {
         setAuthFeedback(err.message, true);
@@ -4342,52 +4412,197 @@
     }
 
     // Engine settings drawer helpers
-    function onProviderChange(val) {
+    function onProviderChange(val, preferredModel = null) {
+      const modelSelect = document.getElementById('settings-model-select');
       const modelInput = document.getElementById('settings-model');
-      if (val === 'gemini') modelInput.value = 'gemini-2.5-flash';
-      else if (val === 'openai') modelInput.value = 'gpt-4o-mini';
-      else if (val === 'anthropic') modelInput.value = 'claude-3-5-sonnet-20241022';
-      else if (val === 'ollama') modelInput.value = 'llama3.2';
-      else if (val === 'mock') modelInput.value = 'mock-cleaner';
+      const customWrap = document.getElementById('settings-custom-model-wrap');
+      const customInput = document.getElementById('settings-custom-model');
+      const keyLabel = document.getElementById('settings-api-key-label');
+      const keyInput = document.getElementById('settings-api-key');
+      const keyHelp = document.getElementById('settings-api-key-help');
+      const baseUrlInput = document.getElementById('settings-base-url');
+
+      const models = COMPATIBLE_MODELS_MAP[val] || COMPATIBLE_MODELS_MAP.gemini;
+      if (modelSelect) {
+        modelSelect.innerHTML = '';
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.value;
+          opt.textContent = m.label;
+          modelSelect.appendChild(opt);
+        });
+
+        const availableValues = models.map(m => m.value);
+        let selectedModel = availableValues[0];
+        if (preferredModel && availableValues.includes(preferredModel)) {
+          selectedModel = preferredModel;
+        } else if (val === 'ollama' && preferredModel && preferredModel !== 'custom') {
+          selectedModel = 'custom';
+          if (customInput) customInput.value = preferredModel;
+        }
+        modelSelect.value = selectedModel;
+        if (selectedModel === 'custom') {
+          customWrap?.classList.remove('hidden');
+          if (modelInput) modelInput.value = (customInput && customInput.value.trim()) || 'llama3.2';
+        } else {
+          customWrap?.classList.add('hidden');
+          if (modelInput) modelInput.value = selectedModel;
+        }
+      }
+
+      // Provider Key text and placeholders
+      if (val === 'gemini') {
+        if (keyLabel) keyLabel.textContent = 'Google Gemini API Key (Optional override)';
+        if (keyInput) keyInput.placeholder = 'Defaults to server GEMINI_API_KEY';
+        if (keyHelp) keyHelp.textContent = 'Google Gemini is active with the server-side key. Personal key is optional.';
+        if (baseUrlInput && !baseUrlInput.value) baseUrlInput.placeholder = 'https://generativelanguage.googleapis.com';
+      } else if (val === 'anthropic') {
+        if (keyLabel) keyLabel.textContent = 'Anthropic API Key (Required)';
+        if (keyInput) keyInput.placeholder = 'sk-ant-api03-...';
+        if (keyHelp) keyHelp.textContent = 'Anthropic Claude requires a personal API key. Server credentials are not shared.';
+      } else if (val === 'openai') {
+        if (keyLabel) keyLabel.textContent = 'OpenAI API Key (Required)';
+        if (keyInput) keyInput.placeholder = 'sk-proj-...';
+        if (keyHelp) keyHelp.textContent = 'OpenAI requires a personal API key. Server credentials are not shared.';
+      } else if (val === 'ollama') {
+        if (keyLabel) keyLabel.textContent = 'API Key (Not Required)';
+        if (keyInput) keyInput.placeholder = 'None required for local Ollama';
+        if (keyHelp) keyHelp.textContent = 'Ollama runs locally on your machine or private network. No cloud key required.';
+        if (baseUrlInput && !baseUrlInput.value) baseUrlInput.value = 'http://localhost:11434';
+      } else if (val === 'mock') {
+        if (keyLabel) keyLabel.textContent = 'API Key (Not Required)';
+        if (keyInput) keyInput.placeholder = 'None required for mock engine';
+        if (keyHelp) keyHelp.textContent = 'Deterministic rule-based mock engine for testing and verification.';
+      }
+
+      // Update Key preview and badges
+      refreshStoredKeyPreview(val);
+    }
+
+    function onModelSelectChange(val) {
+      const customWrap = document.getElementById('settings-custom-model-wrap');
+      const customInput = document.getElementById('settings-custom-model');
+      const modelInput = document.getElementById('settings-model');
+      if (val === 'custom') {
+        customWrap?.classList.remove('hidden');
+        if (modelInput) modelInput.value = (customInput && customInput.value.trim()) || 'llama3.2';
+      } else {
+        customWrap?.classList.add('hidden');
+        if (modelInput) modelInput.value = val;
+      }
+    }
+
+    document.getElementById('settings-custom-model')?.addEventListener('input', (e) => {
+      if (document.getElementById('settings-model-select')?.value === 'custom') {
+        const mInput = document.getElementById('settings-model');
+        if (mInput) mInput.value = e.target.value.trim() || 'llama3.2';
+      }
+    });
+
+    function refreshStoredKeyPreview(provider) {
+      const previews = (userAccountPreferences && userAccountPreferences.api_key_previews) || {};
+      const savedKeyPreview = previews[provider] || (provider === 'gemini' ? userAccountPreferences?.custom_api_key_preview : null);
+      const savedBox = document.getElementById('settings-saved-key-box');
+      const provLabel = document.getElementById('settings-key-provider-label');
+      const previewSpan = document.getElementById('settings-key-preview');
+      const keyBadge = document.getElementById('settings-key-badge');
+
+      if (provLabel) provLabel.textContent = provider;
+
+      if (savedKeyPreview) {
+        if (savedBox) savedBox.classList.remove('hidden');
+        if (previewSpan) previewSpan.textContent = savedKeyPreview;
+        if (keyBadge) {
+          keyBadge.textContent = 'Personal Key Active';
+          keyBadge.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded text-emerald-400 border border-emerald-500/30 bg-emerald-500/10';
+        }
+      } else {
+        if (savedBox) savedBox.classList.add('hidden');
+        if (keyBadge) {
+          if (provider === 'gemini') {
+            keyBadge.textContent = 'Server Key Active';
+            keyBadge.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded text-emerald-400 border border-emerald-500/30 bg-emerald-500/10';
+          } else if (provider === 'anthropic' || provider === 'openai') {
+            keyBadge.textContent = 'Personal Key Required';
+            keyBadge.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded text-amber-400 border border-amber-500/30 bg-amber-500/10';
+          } else if (provider === 'ollama') {
+            keyBadge.textContent = 'Local Endpoint';
+            keyBadge.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded text-sky-400 border border-sky-500/30 bg-sky-500/10';
+          } else {
+            keyBadge.textContent = 'Local Mock';
+            keyBadge.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded text-zinc-400 border border-zinc-500/30 bg-zinc-500/10';
+          }
+        }
+      }
     }
 
     async function deleteSavedApiKey() {
+      const provider = document.getElementById('settings-provider')?.value || 'gemini';
       try {
         const res = await fetch('/api/user/preferences', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ clear_api_key: true })
+          body: JSON.stringify({
+            clear_api_key: true,
+            api_key_provider: provider
+          })
         });
-        if (!res.ok) throw new Error('Failed to delete key');
-        document.getElementById('settings-saved-key-box').classList.add('hidden');
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || 'Failed to delete saved key');
+        }
+        const data = await res.json();
+        userAccountPreferences = data.preferences || userAccountPreferences || {};
+        if (userAccountPreferences.api_key_previews) {
+          delete userAccountPreferences.api_key_previews[provider];
+        }
+        if (provider === 'gemini') {
+          userAccountPreferences.has_custom_api_key = false;
+          userAccountPreferences.custom_api_key_preview = null;
+        }
         document.getElementById('settings-api-key').value = '';
-        showToast('Saved API key deleted from your account.');
+        refreshStoredKeyPreview(provider);
+        showToast(`Saved API key for ${provider} deleted from your account.`);
       } catch (err) {
         showToast(err.message, true);
       }
     }
 
     async function saveEngineSettings() {
-      const apiKey = document.getElementById('settings-api-key').value.trim();
-      const provider = document.getElementById('settings-provider').value;
-      const model = document.getElementById('settings-model').value.trim();
+      const provider = document.getElementById('settings-provider')?.value || 'gemini';
+      const model = document.getElementById('settings-model')?.value.trim() || 'gemini-2.5-flash';
+      const apiKey = document.getElementById('settings-api-key')?.value.trim();
+      const baseUrl = document.getElementById('settings-base-url')?.value.trim();
       const shouldSaveToAccount = document.getElementById('settings-save-key')?.checked;
 
-      if (currentUser && apiKey && shouldSaveToAccount) {
+      if (currentUser && shouldSaveToAccount) {
         try {
-          await fetch('/api/user/preferences', {
+          const payload = {
+            default_provider: provider,
+            default_model: model,
+            api_key_provider: provider
+          };
+          if (apiKey) {
+            payload.custom_api_key = apiKey;
+          }
+          const res = await fetch('/api/user/preferences', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              custom_api_key: apiKey,
-              default_provider: provider,
-              default_model: model
-            })
+            body: JSON.stringify(payload)
           });
-          showToast('Engine settings and encrypted API key saved to your account.');
-          document.getElementById('settings-saved-key-box').classList.remove('hidden');
-          document.getElementById('settings-key-preview').textContent = apiKey.substring(0, 6) + '...' + apiKey.slice(-4);
-        } catch (_) {}
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.detail || 'Failed to save engine settings');
+          }
+          const data = await res.json();
+          userAccountPreferences = data.preferences || userAccountPreferences || {};
+          document.getElementById('settings-api-key').value = '';
+          refreshStoredKeyPreview(provider);
+          showToast(`Preferences and API key for ${provider} saved to your account.`);
+        } catch (err) {
+          showToast(err.message, true);
+          return;
+        }
       } else {
         showToast('Engine settings applied for current session.');
       }

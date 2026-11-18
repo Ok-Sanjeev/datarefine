@@ -698,6 +698,10 @@ class UpdatePreferencesRequest(BaseModel):
     theme: Optional[str] = None
     preferred_provider: Optional[str] = None
     preferred_model: Optional[str] = None
+    default_provider: Optional[str] = None
+    default_model: Optional[str] = None
+    provider: Optional[str] = None
+    api_key_provider: Optional[str] = None
     custom_api_key: Optional[str] = None
     clear_api_key: Optional[bool] = False
 
@@ -821,10 +825,67 @@ def api_auth_me(request: Request):
     return {"authenticated": False, "user": None, "mode": "demo"}
 
 
+def dispatch_password_reset_email(to_email: str, token: str) -> bool:
+    """
+    Send password reset token via SMTP if SMTP_HOST is configured in environment.
+    Never invents hardcoded credentials. Safe fallback with logging.
+    """
+    smtp_host = os.getenv("SMTP_HOST")
+    if not smtp_host:
+        import logging
+        logging.getLogger("uvicorn").info(
+            "SMTP not configured (SMTP_HOST is empty). Password reset token generated without email dispatch."
+        )
+        return False
+
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM", "noreply@datarefine.local")
+    use_tls = os.getenv("SMTP_TLS", "true").lower() in ("true", "1")
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "DataRefine Password Reset Request"
+    msg["From"] = smtp_from
+    msg["To"] = to_email
+
+    text_body = f"""Hello,
+
+You requested a password reset for your DataRefine account.
+Your password reset token is:
+
+{token}
+
+This single-use token will expire in 1 hour. If you did not request this reset, you can safely ignore this email.
+
+— The DataRefine Team
+"""
+    msg.attach(MIMEText(text_body, "plain"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10.0) as server:
+            if use_tls:
+                server.starttls()
+            if smtp_user and smtp_pass:
+                server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_from, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger("uvicorn").error(f"Failed to dispatch password reset email via SMTP: {e}")
+        return False
+
+
 @app.post("/api/auth/password-reset/request")
 def api_password_reset_request(req: PasswordResetRequest):
     """Initiate password reset workflow."""
     reset_token = AUTH_STORE.create_password_reset_token(req.email)
+    if reset_token:
+        dispatch_password_reset_email(req.email, reset_token)
     resp: Dict[str, Any] = {
         "status": "success",
         "message": "If an account exists with this email, password reset instructions have been dispatched.",
@@ -851,7 +912,10 @@ def api_password_reset_confirm(req: PasswordResetConfirmRequest):
 def api_google_auth_url(redirect_uri: Optional[str] = None):
     """Return Google OAuth 2.0 URL with state parameter or 503 if not configured."""
     if not GOOGLE_CLIENT_ID:
-        raise HTTPException(status_code=503, detail="Google OAuth is not configured on this server.")
+        raise HTTPException(
+            status_code=503,
+            detail="Google authentication is temporarily unavailable. Missing required server configuration: GOOGLE_CLIENT_ID environment variable.",
+        )
     state = AUTH_STORE.create_oauth_state()
     cb_uri = redirect_uri or GOOGLE_REDIRECT_URI
     params = {
@@ -1314,15 +1378,48 @@ def api_actions_registry():
 @app.post("/api/plan")
 def api_plan(req: PlanRequest, request: Request = None):
     """Generate a privacy-safe cleaning plan using the requested LLM provider."""
-    # Retrieve user preference key if not explicitly provided in the request
+    req_provider = (req.provider or "gemini").lower()
+
+    # 1. Validate provider and model compatibility
+    from llm_providers import validate_provider_model_compatibility, validate_api_key_format_for_provider
+    try:
+        resolved_model = validate_provider_model_compatibility(req_provider, req.model)
+    except ValueError as val_err:
+        raise HTTPException(status_code=400, detail=str(val_err))
+
+    # 2. Retrieve user preference key if not explicitly provided in the request (provider-isolated)
     current_user = get_current_user_optional(request)
     api_key_to_use = req.api_key
     if not api_key_to_use and current_user:
-        saved_key = AUTH_STORE.get_decrypted_user_api_key(current_user["id"])
+        saved_key = AUTH_STORE.get_decrypted_user_api_key(current_user["id"], provider=req_provider)
         if saved_key:
             api_key_to_use = saved_key
 
-    # 1. Enforce AI rate limiting and server key protection policy
+    # 3. Validate API key format against the target provider
+    if api_key_to_use:
+        try:
+            validate_api_key_format_for_provider(req_provider, api_key_to_use)
+        except ValueError as k_err:
+            raise HTTPException(status_code=400, detail=str(k_err))
+
+    # 4. Check for missing required credentials per provider
+    if req_provider == "anthropic" and not api_key_to_use and not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(
+            status_code=401,
+            detail="Anthropic Claude requires a personal API key. Please configure your personal API key in Engine Settings.",
+        )
+    if req_provider in {"openai", "groq", "vllm"} and not api_key_to_use and not (os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")):
+        raise HTTPException(
+            status_code=401,
+            detail="OpenAI requires a personal API key. Please configure your personal API key in Engine Settings.",
+        )
+    if req_provider == "gemini" and not api_key_to_use and not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(
+            status_code=401,
+            detail="Gemini API key is not configured on the server. Please provide a personal Gemini API key.",
+        )
+
+    # 5. Enforce AI rate limiting and server key protection policy
     has_custom_key = bool(api_key_to_use and api_key_to_use.strip())
     if request is not None:
         enforce_ai_rate_limits(request=request, has_custom_key=has_custom_key)
@@ -1337,8 +1434,8 @@ def api_plan(req: PlanRequest, request: Request = None):
 
     try:
         provider = get_llm_provider(
-            provider_name=req.provider,
-            model_name=req.model,
+            provider_name=req_provider,
+            model_name=resolved_model,
             api_key=api_key_to_use,
             base_url=req.base_url,
         )

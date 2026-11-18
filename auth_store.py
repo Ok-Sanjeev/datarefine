@@ -712,22 +712,64 @@ class AuthStore:
 
         current_prefs = user.get("preferences", {})
 
+        # Provider-isolated custom API keys
+        if "encrypted_api_keys" not in current_prefs or not isinstance(current_prefs["encrypted_api_keys"], dict):
+            current_prefs["encrypted_api_keys"] = {}
+        if "api_key_previews" not in current_prefs or not isinstance(current_prefs["api_key_previews"], dict):
+            current_prefs["api_key_previews"] = {}
+
+        provider_for_key = (
+            new_preferences.get("api_key_provider")
+            or new_preferences.get("provider")
+            or new_preferences.get("preferred_provider")
+            or new_preferences.get("default_provider")
+            or "gemini"
+        ).lower()
+
         # Handle API key encryption if provided
         custom_key = new_preferences.get("custom_api_key")
         if custom_key:
             clean_key = str(custom_key).strip()
-            current_prefs["encrypted_api_key"] = encrypt_user_secret(clean_key)
+            # Enforce cross-provider key validation
+            try:
+                from llm_providers import validate_api_key_format_for_provider
+                validate_api_key_format_for_provider(provider_for_key, clean_key)
+            except ImportError:
+                pass
+            enc_key = encrypt_user_secret(clean_key)
+            preview = f"{clean_key[:6]}...{clean_key[-4:]}" if len(clean_key) > 10 else "configured"
+
+            # Per-provider storage
+            current_prefs["encrypted_api_keys"][provider_for_key] = enc_key
+            current_prefs["api_key_previews"][provider_for_key] = preview
+
+            # Maintain legacy compatibility fields
+            current_prefs["encrypted_api_key"] = enc_key
+            current_prefs["api_key_provider"] = provider_for_key
             current_prefs["has_custom_api_key"] = True
-            current_prefs["custom_api_key_preview"] = (
-                f"{clean_key[:6]}...{clean_key[-4:]}" if len(clean_key) > 10 else "configured"
-            )
+            current_prefs["custom_api_key_preview"] = preview
+
         elif new_preferences.get("clear_api_key"):
-            current_prefs.pop("encrypted_api_key", None)
-            current_prefs.pop("custom_api_key_preview", None)
-            current_prefs["has_custom_api_key"] = False
+            target_prov = new_preferences.get("api_key_provider") or new_preferences.get("provider")
+            if target_prov:
+                t = str(target_prov).lower()
+                current_prefs["encrypted_api_keys"].pop(t, None)
+                current_prefs["api_key_previews"].pop(t, None)
+                if current_prefs.get("api_key_provider") == t:
+                    current_prefs.pop("encrypted_api_key", None)
+                    current_prefs.pop("custom_api_key_preview", None)
+                    current_prefs.pop("api_key_provider", None)
+            else:
+                current_prefs["encrypted_api_keys"] = {}
+                current_prefs["api_key_previews"] = {}
+                current_prefs.pop("encrypted_api_key", None)
+                current_prefs.pop("custom_api_key_preview", None)
+                current_prefs.pop("api_key_provider", None)
+
+            current_prefs["has_custom_api_key"] = bool(current_prefs["encrypted_api_keys"] or current_prefs.get("encrypted_api_key"))
 
         # Merge standard preferences
-        for k in ("theme", "preferred_provider", "preferred_model"):
+        for k in ("theme", "preferred_provider", "preferred_model", "default_provider", "default_model"):
             if k in new_preferences:
                 current_prefs[k] = new_preferences[k]
 
@@ -740,16 +782,17 @@ class AuthStore:
         return self.get_user_preferences(user_id)
 
     def get_user_preferences(self, user_id: str) -> Dict[str, Any]:
-        """Get safe user preferences dictionary (without exposing raw secrets)."""
+        """Get safe user preferences dictionary (without exposing raw secrets or ciphertexts)."""
         user = self.get_user_by_id(user_id)
         if not user:
             return {}
         prefs = dict(user.get("preferences", {}))
-        # Remove internal ciphertext before returning to API
+        # Remove internal ciphertext before returning to API or frontend
         prefs.pop("encrypted_api_key", None)
+        prefs.pop("encrypted_api_keys", None)
         return prefs
 
-    def get_encrypted_user_api_key(self, user_id: str) -> Optional[str]:
+    def get_encrypted_user_api_key(self, user_id: str, provider: Optional[str] = None) -> Optional[str]:
         """Retrieve user's raw encrypted custom API key blob from storage."""
         with self._lock, self._get_connection() as con:
             cur = con.execute("SELECT preferences FROM users WHERE id = ?", (user_id,))
@@ -758,11 +801,19 @@ class AuthStore:
             return None
         try:
             prefs = json.loads(row["preferences"])
+            if provider:
+                p = str(provider).lower()
+                enc_keys = prefs.get("encrypted_api_keys", {})
+                if isinstance(enc_keys, dict) and p in enc_keys:
+                    return enc_keys[p]
+                if prefs.get("api_key_provider") == p:
+                    return prefs.get("encrypted_api_key")
+                return None
             return prefs.get("encrypted_api_key")
         except Exception:
             return None
 
-    def get_decrypted_user_api_key(self, user_id: str) -> Optional[str]:
+    def get_decrypted_user_api_key(self, user_id: str, provider: Optional[str] = None) -> Optional[str]:
         """Internal helper to retrieve user's decrypted custom API key for authorized AI queries."""
         with self._lock, self._get_connection() as con:
             cur = con.execute("SELECT preferences FROM users WHERE id = ?", (user_id,))
@@ -771,6 +822,15 @@ class AuthStore:
             return None
         try:
             prefs = json.loads(row["preferences"])
+            if provider:
+                p = str(provider).lower()
+                enc_keys = prefs.get("encrypted_api_keys", {})
+                if isinstance(enc_keys, dict) and p in enc_keys:
+                    return decrypt_user_secret(enc_keys[p])
+                if prefs.get("api_key_provider") == p and prefs.get("encrypted_api_key"):
+                    return decrypt_user_secret(prefs["encrypted_api_key"])
+                # Strictly isolate: never return another provider's key!
+                return None
             enc_key = prefs.get("encrypted_api_key")
             return decrypt_user_secret(enc_key) if enc_key else None
         except Exception:
@@ -803,16 +863,26 @@ class AuthStore:
             for r in rows:
                 try:
                     prefs = json.loads(r["preferences"])
+                    updated = False
                     enc = prefs.get("encrypted_api_key")
                     if enc:
                         new_enc = rotate_user_secret(enc)
                         if new_enc and new_enc != enc:
                             prefs["encrypted_api_key"] = new_enc
-                            con.execute(
-                                "UPDATE users SET preferences = ? WHERE id = ?",
-                                (json.dumps(prefs), r["id"]),
-                            )
-                            count += 1
+                            updated = True
+                    enc_dict = prefs.get("encrypted_api_keys", {})
+                    if isinstance(enc_dict, dict):
+                        for prov, prov_enc in enc_dict.items():
+                            new_prov_enc = rotate_user_secret(prov_enc)
+                            if new_prov_enc and new_prov_enc != prov_enc:
+                                enc_dict[prov] = new_prov_enc
+                                updated = True
+                    if updated:
+                        con.execute(
+                            "UPDATE users SET preferences = ? WHERE id = ?",
+                            (json.dumps(prefs), r["id"]),
+                        )
+                        count += 1
                 except Exception:
                     continue
         return count

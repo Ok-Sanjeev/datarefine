@@ -119,7 +119,9 @@ class OpenAIProvider(BaseLLMProvider):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
     ):
-        resolved_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY") or "dummy-key"
+        resolved_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+        if not resolved_key:
+            raise ValueError("OPENAI_API_KEY is not configured.")
         resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
         super().__init__(model_name=model_name, api_key=resolved_key, base_url=resolved_base_url)
 
@@ -294,6 +296,126 @@ class MockProvider(BaseLLMProvider):
         return self._plan_json
 
 
+COMPATIBLE_MODELS: Dict[str, list] = {
+    "gemini": [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ],
+    "anthropic": [
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-opus-20240229",
+    ],
+    "openai": [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "o3-mini",
+        "gpt-4-turbo",
+    ],
+    "ollama": [
+        "llama3.2",
+        "llama3",
+        "mistral",
+        "qwen2.5",
+        "phi3",
+    ],
+    "mock": [
+        "mock-planner",
+    ],
+}
+
+
+def validate_provider_model_compatibility(provider: str, model: Optional[str]) -> str:
+    """
+    Validate that model is compatible with provider.
+    Returns the resolved valid model name.
+    Raises ValueError if incompatible.
+    """
+    p = (provider or "gemini").lower()
+    if p in {"vllm", "groq", "together"}:
+        p = "openai"
+    elif p in {"local"}:
+        p = "ollama"
+
+    if p not in COMPATIBLE_MODELS:
+        raise ValueError(
+            f"Unsupported LLM provider: '{provider}'. "
+            f"Supported providers: {list(COMPATIBLE_MODELS.keys())}"
+        )
+
+    if not model or not str(model).strip():
+        return COMPATIBLE_MODELS[p][0]
+
+    m = str(model).strip()
+    m_lower = m.lower()
+
+    if p == "ollama":
+        if m_lower.startswith(("gemini-", "claude-", "gpt-", "o3-")):
+            raise ValueError(
+                f"Cloud model '{m}' cannot be used with local Ollama provider. "
+                f"Please choose an Ollama model (e.g. llama3.2) or enter a custom local model tag."
+            )
+        return m
+
+    if p == "gemini":
+        if m_lower.startswith(("claude-", "gpt-", "o3-", "llama")):
+            raise ValueError(
+                f"Model '{m}' is incompatible with Gemini provider. "
+                f"Compatible Gemini models: {', '.join(COMPATIBLE_MODELS['gemini'])}"
+            )
+        return m
+
+    if p == "anthropic":
+        if m_lower.startswith(("gemini-", "gpt-", "o3-", "llama")):
+            raise ValueError(
+                f"Model '{m}' is incompatible with Anthropic Claude provider. "
+                f"Compatible Claude models: {', '.join(COMPATIBLE_MODELS['anthropic'])}"
+            )
+        return m
+
+    if p == "openai":
+        if m_lower.startswith(("gemini-", "claude-", "llama")):
+            raise ValueError(
+                f"Model '{m}' is incompatible with OpenAI provider. "
+                f"Compatible OpenAI models: {', '.join(COMPATIBLE_MODELS['openai'])}"
+            )
+        return m
+
+    return m
+
+
+def validate_api_key_format_for_provider(provider: str, api_key: Optional[str]) -> None:
+    """
+    Ensure API key is not from an incompatible provider.
+    Enforces strict cross-provider key isolation.
+    """
+    if not api_key:
+        return
+    k = str(api_key).strip()
+    p = (provider or "").lower()
+    if p in {"vllm", "groq", "together"}:
+        p = "openai"
+
+    if p == "anthropic":
+        if k.startswith("AIzaSy"):
+            raise ValueError("Google Gemini API key provided for Anthropic Claude. Never use one provider's key for another.")
+        if k.startswith("sk-proj-"):
+            raise ValueError("OpenAI project API key provided for Anthropic Claude. Never use one provider's key for another.")
+    elif p == "openai":
+        if k.startswith("AIzaSy"):
+            raise ValueError("Google Gemini API key provided for OpenAI. Never use one provider's key for another.")
+        if k.startswith("sk-ant-"):
+            raise ValueError("Anthropic Claude API key provided for OpenAI. Never use one provider's key for another.")
+    elif p == "gemini":
+        if k.startswith("sk-ant-"):
+            raise ValueError("Anthropic Claude API key provided for Google Gemini. Never use one provider's key for another.")
+        if k.startswith("sk-") and not k.startswith("AIzaSy"):
+            raise ValueError("OpenAI/Anthropic API key provided for Google Gemini. Never use one provider's key for another.")
+
+
 def get_llm_provider(
     provider_name: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -316,27 +438,26 @@ def get_llm_provider(
         or ("ollama" if os.getenv("OLLAMA_HOST") else "gemini")
     ).lower()
 
-    resolved_model = model_name or os.getenv("LLM_MODEL")
+    # Validate provider and model compatibility
+    resolved_model = validate_provider_model_compatibility(resolved_provider, model_name or os.getenv("LLM_MODEL"))
+
+    # Validate format of any provided API key
+    validate_api_key_format_for_provider(resolved_provider, api_key)
 
     if resolved_provider == "gemini":
-        model = resolved_model or "gemini-2.5-flash"
-        return GeminiProvider(model_name=model, api_key=api_key)
+        return GeminiProvider(model_name=resolved_model, api_key=api_key)
 
     elif resolved_provider in {"openai", "vllm", "groq", "together"}:
-        model = resolved_model or "gpt-4o-mini"
-        return OpenAIProvider(model_name=model, api_key=api_key, base_url=base_url)
+        return OpenAIProvider(model_name=resolved_model, api_key=api_key, base_url=base_url)
 
     elif resolved_provider == "anthropic":
-        model = resolved_model or "claude-3-5-haiku-20241022"
-        return AnthropicProvider(model_name=model, api_key=api_key, base_url=base_url)
+        return AnthropicProvider(model_name=resolved_model, api_key=api_key, base_url=base_url)
 
     elif resolved_provider in {"ollama", "local"}:
-        model = resolved_model or "llama3"
-        return OllamaProvider(model_name=model, base_url=base_url, api_key=api_key)
+        return OllamaProvider(model_name=resolved_model, base_url=base_url, api_key=api_key)
 
     elif resolved_provider == "mock":
-        model = resolved_model or "mock-model"
-        return MockProvider(model_name=model)
+        return MockProvider(model_name=resolved_model)
 
     else:
         raise ValueError(
