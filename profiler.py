@@ -453,6 +453,40 @@ def compute_column_quality_categories(series, column_name, semantic_hints=None):
         "explanation": "; ".join(format_notes) if format_notes else "Consistent formatting throughout column."
     }
 
+    # F. Formula Injection Risk (H2)
+    formula_count = 0
+    formula_samples = []
+    if (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)) and len(non_null) > 0:
+        str_s = series.dropna().astype(str)
+        def is_formula_val(val: str) -> bool:
+            if not val:
+                return False
+            first = val[0]
+            if first in ("=", "@", "\t", "\r"):
+                return True
+            if first in ("+", "-"):
+                try:
+                    float(val.strip())
+                    return False
+                except ValueError:
+                    return True
+            return False
+
+        formula_mask = str_s.apply(is_formula_val)
+        formula_count = int(formula_mask.sum())
+        if formula_count > 0:
+            formula_samples = str_s[formula_mask].head(3).tolist()
+
+    categories["formula_injection"] = {
+        "category": "CSV Formula Injection Risk",
+        "count": formula_count,
+        "percentage": round((formula_count / max(1, total)) * 100, 2),
+        "notes": [f"{formula_count} potential spreadsheet formula cell(s) detected"] if formula_count > 0 else [],
+        "samples": formula_samples,
+        "status": "detected" if formula_count > 0 else "clean",
+        "explanation": f"{formula_count} cell(s) begin with '=', '+', '-', '@' and may execute formulas in Excel/Sheets." if formula_count > 0 else "No formula injection patterns detected.",
+    }
+
     return categories
 
 
@@ -501,15 +535,26 @@ def profile_column(series, column_name=None):
             .to_dict()
         )
 
-    if (
+    is_native_numeric = (
         pd.api.types.is_numeric_dtype(series)
         and not pd.api.types.is_bool_dtype(series)
-        and "possible_identifier"
-        not in semantic_hints
+        and "possible_identifier" not in semantic_hints
+    )
+
+    if is_native_numeric:
+        column_profile["statistics"] = compute_iqr_statistics(series)
+    elif (
+        (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series))
+        and "possible_identifier" not in semantic_hints
     ):
-        column_profile[
-            "statistics"
-        ] = compute_iqr_statistics(series)
+        # L4: Tolerant numeric type inference for numeric columns with isolated non-numeric cells
+        non_null = series.dropna()
+        if len(non_null) >= 3:
+            coerced = pd.to_numeric(non_null, errors="coerce")
+            valid_nums = coerced.dropna()
+            if len(valid_nums) >= 3 and (len(valid_nums) / len(non_null)) >= 0.70:
+                column_profile["inferred_numeric"] = True
+                column_profile["statistics"] = compute_iqr_statistics(valid_nums)
 
     return column_profile
 
@@ -575,6 +620,10 @@ def build_profile(df):
         "formatting_issues": {
             "total_count": sum(cp.get("quality_categories", {}).get("formatting_issues", {}).get("count", 0) for cp in profile["column_profiles"].values()),
             "affected_columns": [c for c, cp in profile["column_profiles"].items() if cp.get("quality_categories", {}).get("formatting_issues", {}).get("count", 0) > 0],
+        },
+        "formula_injection": {
+            "total_count": sum(cp.get("quality_categories", {}).get("formula_injection", {}).get("count", 0) for cp in profile["column_profiles"].values()),
+            "affected_columns": [c for c, cp in profile["column_profiles"].items() if cp.get("quality_categories", {}).get("formula_injection", {}).get("count", 0) > 0],
         },
     }
 

@@ -152,4 +152,16 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if is_https:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
+        # 7. Strip server fingerprinting headers (L2)
+        for fingerprint_header in (
+            "server",
+            "Server",
+            "x-render-origin-server",
+            "X-Render-Origin-Server",
+            "x-powered-by",
+            "X-Powered-By",
+        ):
+            if fingerprint_header in response.headers:
+                del response.headers[fingerprint_header]
+
         return response

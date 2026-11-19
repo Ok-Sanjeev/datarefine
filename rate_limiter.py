@@ -94,6 +94,7 @@ def get_rate_limit_configs() -> Dict[str, Any]:
     default_fallback = "false" if env in ("production", "prod") else "true"
     return {
         "global_per_minute": int(os.getenv("GLOBAL_RATE_LIMIT_PER_MINUTE", "120")),
+        "auth_per_minute": int(os.getenv("AUTH_RATE_LIMIT_PER_MINUTE", "10")),
         "ai_per_minute": int(os.getenv("AI_RATE_LIMIT_PER_MINUTE", "10")),
         "ai_server_key_per_hour": int(os.getenv("AI_SERVER_KEY_LIMIT_PER_HOUR", "20")),
         "allow_server_gemini_fallback": os.getenv("ALLOW_SERVER_GEMINI_FALLBACK", default_fallback).lower() in ("true", "1", "yes"),
@@ -168,5 +169,28 @@ def enforce_global_rate_limit(request: Request) -> None:
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please slow down.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def enforce_auth_rate_limit(request: Request, category: str = "auth_login") -> None:
+    """
+    Enforce per-IP sliding-window rate limit on authentication endpoints.
+    Protects register, login, and password-reset from brute-force and email spam.
+    """
+    configs = get_rate_limit_configs()
+    client_ip = limiter.get_client_ip(request)
+
+    max_reqs = configs.get("auth_per_minute", 10)
+    allowed, retry_after = limiter.is_allowed(
+        client_ip=client_ip,
+        category=category,
+        max_requests=max_reqs,
+        window_seconds=60,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Please slow down and try again later.",
             headers={"Retry-After": str(retry_after)},
         )

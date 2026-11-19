@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from rate_limiter import enforce_ai_rate_limits, enforce_global_rate_limit, limiter
+from rate_limiter import enforce_ai_rate_limits, enforce_global_rate_limit, enforce_auth_rate_limit, limiter
 from security_utils import (
     SecurityHeadersMiddleware,
     sanitize_secret_strings,
@@ -73,10 +73,16 @@ from reconciliation import reconcile_column_candidates, REFERENCE_CATALOGS
 from workflow_recipe import WorkflowRecipeManager, _resolve_column_reference
 
 
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+is_production = ENVIRONMENT in ("production", "prod")
+
 app = FastAPI(
     title="DataRefine — AI-Powered Data Preparation & Quality Platform",
     description="Industrial Data Wrangling, Built Natively in Python. Deterministic Data Cleaning, Visual Diffs & Checkpoint Rollback",
     version="2.0.0",
+    docs_url=None if is_production else "/docs",
+    redoc_url=None if is_production else "/redoc",
+    openapi_url=None if is_production else "/openapi.json",
 )
 
 # Security Constants & Approved Base Directories
@@ -148,6 +154,33 @@ async def rate_limiting_middleware(request: Request, call_next):
     if path.startswith("/api/") and path != "/api/health":
         enforce_global_rate_limit(request)
     response = await call_next(request)
+    return response
+
+
+@app.middleware("http")
+async def guest_session_middleware(request: Request, call_next):
+    """Ensure every visitor receives an isolated guest session identifier (H1)."""
+    guest_cookie = request.cookies.get("guest_id") or request.headers.get("x-guest-id")
+    should_set_cookie = False
+    if not guest_cookie:
+        request.state.guest_id = f"guest_{secrets.token_hex(12)}"
+        should_set_cookie = True
+    else:
+        clean = re.sub(r"[^\w\-]", "", guest_cookie)[:64]
+        request.state.guest_id = clean if clean else f"guest_{secrets.token_hex(12)}"
+
+    response = await call_next(request)
+    if should_set_cookie and "guest_id" not in response.headers.get("set-cookie", ""):
+        is_prod = ENVIRONMENT in ("production", "prod")
+        response.set_cookie(
+            key="guest_id",
+            value=request.state.guest_id,
+            httponly=True,
+            secure=is_prod,
+            samesite="lax",
+            max_age=30 * 86400,
+            path="/",
+        )
     return response
 
 
@@ -266,11 +299,34 @@ def get_current_user(request: Request) -> Dict[str, Any]:
     return user
 
 
-def resolve_safe_dataset_path(client_path: str, user_id: Optional[str] = None) -> Path:
+def get_guest_id(request: Optional[Request]) -> str:
+    """Extract or generate an isolated anonymous guest session ID (H1)."""
+    if not request:
+        return "demo"
+    guest_header = request.headers.get("x-guest-id") or request.headers.get("X-Guest-ID")
+    if guest_header:
+        clean = re.sub(r"[^\w\-]", "", guest_header)[:64]
+        if clean:
+            return clean
+    guest_cookie = request.cookies.get("guest_id") or request.cookies.get("guest_session_id")
+    if guest_cookie:
+        clean = re.sub(r"[^\w\-]", "", guest_cookie)[:64]
+        if clean:
+            return clean
+    if hasattr(request, "state") and getattr(request.state, "guest_id", None):
+        return request.state.guest_id
+    return "demo"
+
+
+def resolve_safe_dataset_path(
+    client_path: str,
+    user_id: Optional[str] = None,
+    guest_id: Optional[str] = None,
+) -> Path:
     """
     Safely resolve a client-supplied dataset filepath with multi-tenant isolation.
     Enforces strict confinement to approved dataset directories and ensures
-    authenticated users cannot access other users' isolated upload directories.
+    authenticated users and anonymous visitors cannot access other visitors' isolated upload directories.
     """
     if not client_path or not isinstance(client_path, str):
         raise HTTPException(status_code=400, detail="Invalid filepath provided.")
@@ -309,11 +365,21 @@ def resolve_safe_dataset_path(client_path: str, user_id: Optional[str] = None) -
         if len(rel_upload.parts) > 1:
             owner_subfolder = rel_upload.parts[0]
             if owner_subfolder != "demo":
+                # Authenticated user upload folder
                 if not user_id or user_id != owner_subfolder:
                     raise HTTPException(
                         status_code=403,
                         detail="Forbidden: You do not have permission to access another user's uploaded dataset."
                     )
+            else:
+                # Anonymous visitor subfolder (demo/<guest_id>/...)
+                if len(rel_upload.parts) > 2:
+                    guest_folder = rel_upload.parts[1]
+                    if not guest_id or guest_id != guest_folder:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Forbidden: You do not have permission to access another visitor's uploaded dataset."
+                        )
     except ValueError:
         pass
 
@@ -437,6 +503,30 @@ def sanitize_obj_for_json(obj: Any) -> Any:
     return sanitize_value_for_json(obj)
 
 
+def sanitize_dataframe_for_csv_export(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitize dataframe cells to prevent CSV formula injection (OWASP CSV Injection, H2).
+    Prepends a single quote "'" to string cells starting with =, +, -, @, \t, or \r.
+    """
+    df_safe = df.copy()
+    for col in df_safe.columns:
+        if pd.api.types.is_string_dtype(df_safe[col]) or pd.api.types.is_object_dtype(df_safe[col]):
+            def sanitize_cell(val):
+                if isinstance(val, str) and len(val) > 0:
+                    first = val[0]
+                    if first in ("=", "@", "\t", "\r"):
+                        return "'" + val
+                    if first in ("+", "-"):
+                        try:
+                            float(val.strip())
+                            return val
+                        except ValueError:
+                            return "'" + val
+                return val
+            df_safe[col] = df_safe[col].apply(sanitize_cell)
+    return df_safe
+
+
 def compute_column_distributions(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """Compute summary distributions (top categories, numeric stats) for each column."""
     distributions = {}
@@ -447,22 +537,34 @@ def compute_column_distributions(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         null_pct = round((null_count / total * 100), 2) if total > 0 else 0.0
         unique_count = int(series.nunique(dropna=True))
 
+        is_numeric = bool(pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series))
+        clean_num_series = None
+        if is_numeric:
+            clean_num_series = series.dropna()
+        elif pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            # L4: Tolerant numeric type inference for numeric columns with isolated non-numeric cells
+            non_null = series.dropna()
+            if len(non_null) >= 3:
+                coerced = pd.to_numeric(non_null, errors="coerce")
+                valid_nums = coerced.dropna()
+                if len(valid_nums) >= 3 and (len(valid_nums) / len(non_null)) >= 0.70:
+                    is_numeric = True
+                    clean_num_series = valid_nums
+
         dist: Dict[str, Any] = {
             "null_count": null_count,
             "null_percentage": null_pct,
             "unique_count": unique_count,
-            "is_numeric": bool(pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)),
+            "is_numeric": is_numeric,
         }
 
-        if dist["is_numeric"]:
-            clean_s = series.dropna()
-            if not clean_s.empty:
-                dist["numeric_stats"] = {
-                    "min": sanitize_value_for_json(clean_s.min()),
-                    "max": sanitize_value_for_json(clean_s.max()),
-                    "mean": round(float(clean_s.mean()), 2),
-                    "median": sanitize_value_for_json(clean_s.median()),
-                }
+        if is_numeric and clean_num_series is not None and not clean_num_series.empty:
+            dist["numeric_stats"] = {
+                "min": sanitize_value_for_json(clean_num_series.min()),
+                "max": sanitize_value_for_json(clean_num_series.max()),
+                "mean": round(float(clean_num_series.mean()), 2),
+                "median": sanitize_value_for_json(clean_num_series.median()),
+            }
 
         # Top 5 most frequent values
         top_counts = series.value_counts(dropna=True).head(5)
@@ -735,6 +837,8 @@ class ClaimSessionRequest(BaseModel):
 @app.post("/api/auth/register")
 def api_register(req: RegisterRequest, request: Request = None, response: Response = None):
     """Register a new user account with Argon2id password hashing."""
+    if request:
+        enforce_auth_rate_limit(request, category="auth_register")
     try:
         user = AUTH_STORE.register_user(
             email=req.email,
@@ -762,6 +866,8 @@ def api_register(req: RegisterRequest, request: Request = None, response: Respon
 @app.post("/api/auth/login")
 def api_login(req: LoginRequest, request: Request = None, response: Response = None):
     """Authenticate with email and password and issue a 256-bit Bearer auth token."""
+    if request:
+        enforce_auth_rate_limit(request, category="auth_login")
     user = AUTH_STORE.authenticate_email_password(req.email, req.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -896,8 +1002,10 @@ This single-use token will expire in 1 hour. If you did not request this reset, 
 
 
 @app.post("/api/auth/password-reset/request")
-def api_password_reset_request(req: PasswordResetRequest):
+def api_password_reset_request(req: PasswordResetRequest, request: Request = None):
     """Initiate password reset workflow."""
+    if request:
+        enforce_auth_rate_limit(request, category="auth_password_reset")
     reset_token = AUTH_STORE.create_password_reset_token(req.email)
     if reset_token:
         dispatch_password_reset_email(req.email, reset_token)
@@ -912,8 +1020,10 @@ def api_password_reset_request(req: PasswordResetRequest):
 
 
 @app.post("/api/auth/password-reset/confirm")
-def api_password_reset_confirm(req: PasswordResetConfirmRequest):
+def api_password_reset_confirm(req: PasswordResetConfirmRequest, request: Request = None):
     """Complete password reset using token and revoke previous tokens."""
+    if request:
+        enforce_auth_rate_limit(request, category="auth_password_reset")
     try:
         success = AUTH_STORE.reset_password_with_token(req.token, req.new_password)
         if not success:
@@ -1119,89 +1229,95 @@ def get_health():
 
 @app.get("/api/datasets")
 def list_datasets(request: Request = None):
-    """Discover available CSV datasets with multi-tenant isolation."""
+    """Discover available CSV datasets with multi-tenant isolation (H1, L3)."""
     current_user = get_current_user_optional(request)
     user_id = current_user["id"] if current_user else None
+    guest_id = get_guest_id(request) if not current_user else None
 
     datasets = []
-    base_data = "data"
-    uploads_dir = os.path.join(base_data, "uploads")
-    sessions_dir = os.path.join(base_data, "sessions")
 
-    # 1. Base data files (excluding uploads and sessions)
-    for root, dirs, files in os.walk(base_data):
-        # Exclude uploads/ and sessions/ from general walk
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in (uploads_dir, sessions_dir)]
-        for f in files:
-            if f.endswith(".csv") and not f.startswith("cleaned_"):
-                full_path = os.path.join(root, f)
-                rel_path = os.path.relpath(full_path, start=".")
-                try:
-                    size_kb = round(os.path.getsize(full_path) / 1024, 1)
-                    datasets.append({
-                        "name": f,
-                        "path": rel_path.replace("\\", "/"),
-                        "size_kb": size_kb,
-                        "is_benchmark": "benchmark" in rel_path,
-                    })
-                except Exception:
-                    pass
+    # 1. Curated, Safe Public Demonstration Datasets Only (L3)
+    # Never expose internal benchmark ground-truth, robustness test files, or server absolute paths
+    public_demos = [
+        {"name": "Indian Tech Jobs 2026", "file": "data/indian_tech_jobs_2026.csv", "is_benchmark": False},
+        {"name": "OTT Viewer Retention", "file": "data/ott_viewer_dropoff_retention_us_v1.0.csv", "is_benchmark": False},
+        {"name": "Employee Records (Messy)", "file": "data/Messy_Employee_dataset.csv", "is_benchmark": False},
+        {"name": "Benchmark Sample Dataset", "file": "data/benchmark/dirty_sample.csv", "is_benchmark": True},
+        {"name": "Test Customers Dataset", "file": "data/test_customers.csv", "is_benchmark": True},
+    ]
+    for demo in public_demos:
+        p = (BASE_DIR / demo["file"]).resolve()
+        if p.exists() and p.is_file():
+            try:
+                size_kb = round(os.path.getsize(p) / 1024, 1)
+                datasets.append({
+                    "name": demo["name"],
+                    "path": demo["file"],
+                    "size_kb": size_kb,
+                    "is_benchmark": demo["is_benchmark"],
+                    "is_public_demo": True,
+                })
+            except Exception:
+                pass
 
-    # 2. User-specific uploads or demo uploads
-    allowed_subfolders = ["demo"]
+    # 2. Caller-Specific Isolated Uploads Only (H1)
+    # Strictly scoped: never returns other users' or other visitors' files
+    uploads_dir = Path(BASE_DIR / "data" / "uploads")
     if user_id:
-        allowed_subfolders.append(user_id)
+        caller_upload_dir = uploads_dir / user_id
+    elif guest_id and guest_id != "demo":
+        caller_upload_dir = uploads_dir / "demo" / guest_id
+    else:
+        caller_upload_dir = None
 
-    if os.path.exists(uploads_dir):
-        # Direct files in uploads/ (backwards compat)
-        for f in os.listdir(uploads_dir):
-            full_path = os.path.join(uploads_dir, f)
-            if os.path.isfile(full_path) and f.endswith(".csv") and not f.startswith("cleaned_"):
-                rel_path = os.path.relpath(full_path, start=".")
+    if caller_upload_dir and caller_upload_dir.exists() and caller_upload_dir.is_dir():
+        for f in os.listdir(caller_upload_dir):
+            full_path = caller_upload_dir / f
+            if full_path.is_file() and f.endswith(".csv") and not f.startswith("cleaned_"):
+                rel_path = str(full_path.relative_to(BASE_DIR)).replace("\\", "/")
                 try:
                     size_kb = round(os.path.getsize(full_path) / 1024, 1)
                     datasets.append({
                         "name": f,
-                        "path": rel_path.replace("\\", "/"),
+                        "path": rel_path,
                         "size_kb": size_kb,
                         "is_benchmark": False,
+                        "is_public_demo": False,
                     })
                 except Exception:
                     pass
 
-        # Subfolders
-        for sub in allowed_subfolders:
-            sub_dir = os.path.join(uploads_dir, sub)
-            if os.path.exists(sub_dir) and os.path.isdir(sub_dir):
-                for f in os.listdir(sub_dir):
-                    full_path = os.path.join(sub_dir, f)
-                    if os.path.isfile(full_path) and f.endswith(".csv") and not f.startswith("cleaned_"):
-                        rel_path = os.path.relpath(full_path, start=".")
-                        try:
-                            size_kb = round(os.path.getsize(full_path) / 1024, 1)
-                            datasets.append({
-                                "name": f,
-                                "path": rel_path.replace("\\", "/"),
-                                "size_kb": size_kb,
-                                "is_benchmark": False,
-                            })
-                        except Exception:
-                            pass
-
-    return {"datasets": sorted(datasets, key=lambda d: (not d["is_benchmark"], d["name"]))}
+    return {"datasets": sorted(datasets, key=lambda d: (not d.get("is_public_demo", False), d["name"]))}
 
 
 @app.post("/api/upload")
-async def upload_dataset(file: UploadFile = File(...), request: Request = None):
-    """Upload a CSV dataset with strict size, filename, format, and multi-tenant security validation."""
+async def upload_dataset(file: UploadFile = File(...), request: Request = None, response: Response = None):
+    """Upload a CSV dataset with strict size, filename, format, and multi-tenant security validation (H1)."""
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files (.csv) are supported.")
 
     current_user = get_current_user_optional(request)
-    user_subfolder = current_user["id"] if current_user else "demo"
+    guest_id = get_guest_id(request) if not current_user else None
     max_upload_size = MAX_UPLOAD_SIZE_BYTES if current_user else MAX_DEMO_UPLOAD_SIZE_BYTES
 
-    target_dir = Path(UPLOAD_DIR) / user_subfolder
+    if current_user:
+        user_subfolder = current_user["id"]
+        target_dir = Path(UPLOAD_DIR) / user_subfolder
+    else:
+        user_subfolder = f"demo/{guest_id}"
+        target_dir = Path(UPLOAD_DIR) / "demo" / guest_id
+        if response:
+            is_prod = ENVIRONMENT in ("production", "prod")
+            response.set_cookie(
+                key="guest_id",
+                value=guest_id,
+                httponly=True,
+                secure=is_prod,
+                samesite="lax",
+                max_age=30 * 86400,
+                path="/",
+            )
+
     target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(file.filename)
@@ -1256,6 +1372,7 @@ async def upload_dataset(file: UploadFile = File(...), request: Request = None):
         "filename": safe_name,
         "size_bytes": bytes_read,
         "owner_id": user_subfolder,
+        "guest_id": guest_id,
     }
 
 
@@ -1271,9 +1388,10 @@ def api_profile(req: ProfileRequest, request: Request = None):
 
     current_user = get_current_user_optional(request)
     user_id = current_user["id"] if current_user else None
+    guest_id = get_guest_id(request) if not current_user else None
 
     # Validate and securely resolve path within approved dataset directories
-    safe_path = resolve_safe_dataset_path(filepath_str, user_id=user_id)
+    safe_path = resolve_safe_dataset_path(filepath_str, user_id=user_id, guest_id=guest_id)
 
     with heavy_operation_slot():
         try:
@@ -1653,9 +1771,10 @@ def api_clean(req: CleanRequest, request: Request = None):
     )
     session["report"] = report
 
-    # Save cleaned file & report to disk
+    # Save cleaned file & report to disk (neutralizing formula injection on export, H2)
     cleaned_csv_path = os.path.join(session["run_dir"], "cleaned_data.csv")
-    df_cleaned.to_csv(cleaned_csv_path, index=False)
+    df_export = sanitize_dataframe_for_csv_export(df_cleaned)
+    df_export.to_csv(cleaned_csv_path, index=False)
     session["cleaned_csv_path"] = cleaned_csv_path
 
     report_json_path = os.path.join(session["run_dir"], "cleaning_report.json")
@@ -1902,12 +2021,13 @@ def api_evaluate(req: EvaluateRequest, request: Request = None):
 
 @app.get("/api/download/cleaned")
 def download_cleaned(session_id: str = Query(...), token: Optional[str] = Query(None), request: Request = None):
-    """Download cleaned CSV dataset with authenticated headers and no-store caching."""
+    """Download cleaned CSV dataset with authenticated headers and no-store caching (H2 formula sanitized)."""
     session = get_authenticated_session(session_id, request, token=token)
     df = session["df_current"]
 
     temp_path = os.path.join(session["run_dir"], "cleaned_download.csv")
-    df.to_csv(temp_path, index=False)
+    df_export = sanitize_dataframe_for_csv_export(df)
+    df_export.to_csv(temp_path, index=False)
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
         "Pragma": "no-cache",
@@ -3193,6 +3313,24 @@ def workspace_page():
     )
 
 
+@app.get("/robots.txt", include_in_schema=False)
+def serve_robots_txt():
+    """Serve robots.txt for search engine crawlers (L1)."""
+    p = BASE_DIR / "static" / "robots.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain")
+    return Response("User-agent: *\nAllow: /\nDisallow: /api/\n", media_type="text/plain")
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def serve_sitemap_xml():
+    """Serve sitemap.xml for search engine indexing (L1)."""
+    p = BASE_DIR / "static" / "sitemap.xml"
+    if p.exists():
+        return FileResponse(p, media_type="application/xml")
+    return Response('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>/</loc></url></urlset>', media_type="application/xml")
+
+
 @app.exception_handler(404)
 async def custom_404_handler(request: Request, exc):
     """Clean, branded 404 page for unknown routes, returning JSON for API requests."""
@@ -3238,7 +3376,7 @@ def main():
     print(f"\n=======================================================")
     print(f"  DataRefine — Data Quality & Cleaning Studio")
     print(f"  Running at: http://{args.host}:{args.port}")
-    print(f"=======================================================\n")
+    print(f"=======================================================")
     uvicorn.run(
         "server:app",
         host=args.host,
@@ -3246,6 +3384,7 @@ def main():
         reload=False,
         proxy_headers=True,
         forwarded_allow_ips="*",
+        server_header=False,
     )
 
 
